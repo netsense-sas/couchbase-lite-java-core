@@ -53,13 +53,16 @@ import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.StringTokenizer;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -70,6 +73,9 @@ public final class Database {
     // Default value for maxRevTreeDepth, the max rev depth to preserve in a prune operation
     private static final int DEFAULT_MAX_REVS = Integer.MAX_VALUE;
 
+    // When this many changes pile up in _changesToNotify, start removing their bodies to save RAM
+    private static final int MANY_CHANGES_TO_NOTIFY = 5000;
+
     private static ReplicationFilterCompiler filterCompiler;
 
     private String path;
@@ -77,7 +83,17 @@ public final class Database {
     private SQLiteStorageEngine database;
 
     private boolean open = false;
-    private int transactionLevel = 0;
+
+    // transactionLevel is per thread
+    static class TransactionLevel extends ThreadLocal<Integer> {
+        @Override
+        protected Integer initialValue() {
+            return 0;
+        }
+    }
+
+    private TransactionLevel transactionLevel = new TransactionLevel();
+
 
     /**
      * @exclude
@@ -95,6 +111,7 @@ public final class Database {
     private BlobStore attachments;
     private Manager manager;
     final private CopyOnWriteArrayList<ChangeListener> changeListeners;
+    final private CopyOnWriteArrayList<DatabaseListener> databaseListeners;
     private Cache<String, Document> docCache;
     private List<DocumentChange> changesToNotify;
     private boolean postingChangeNotifications;
@@ -156,6 +173,9 @@ public final class Database {
     /**
      * @exclude
      */
+    // First-time initialization:
+    // (Note: Declaring revs.sequence as AUTOINCREMENT means the values will always be
+    // monotonically increasing, never reused. See <http://www.sqlite.org/autoinc.html>)
     public static final String SCHEMA = "" +
             "CREATE TABLE docs ( " +
             "        doc_id INTEGER PRIMARY KEY, " +
@@ -168,8 +188,8 @@ public final class Database {
             "        parent INTEGER REFERENCES revs(sequence) ON DELETE SET NULL, " +
             "        current BOOLEAN, " +
             "        deleted BOOLEAN DEFAULT 0, " +
-            "        json BLOB); " +
-            "    CREATE INDEX revs_by_id ON revs(revid, doc_id); " +
+            "        json BLOB, " +
+            "        UNIQUE (doc_id, revid)); " +
             "    CREATE INDEX revs_current ON revs(doc_id, current); " +
             "    CREATE INDEX revs_parent ON revs(parent); " +
             "    CREATE TABLE localdocs ( " +
@@ -232,11 +252,12 @@ public final class Database {
         this.name = FileDirUtils.getDatabaseNameFromPath(path);
         this.manager = manager;
         this.changeListeners = new CopyOnWriteArrayList<ChangeListener>();
+        this.databaseListeners = new CopyOnWriteArrayList<DatabaseListener>();
         this.docCache = new Cache<String, Document>();
         this.startTime = System.currentTimeMillis();
         this.changesToNotify = new ArrayList<DocumentChange>();
-        this.activeReplicators =  Collections.newSetFromMap(new ConcurrentHashMap());
-        this.allReplicators = Collections.newSetFromMap(new ConcurrentHashMap());
+        this.activeReplicators =  Collections.synchronizedSet(new HashSet());
+        this.allReplicators = Collections.synchronizedSet(new HashSet());
     }
 
     /**
@@ -384,14 +405,6 @@ public final class Database {
         //recursively delete attachments path
         boolean deleteAttachmentStatus = FileDirUtils.deleteRecursive(attachmentsFile);
 
-        //recursively delete path where attachments stored( see getAttachmentStorePath())
-        int lastDotPosition = path.lastIndexOf('.');
-        if( lastDotPosition > 0 ) {
-            File attachmentsFileUpFolder = new File(path.substring(0, lastDotPosition));
-            FileDirUtils.deleteRecursive(attachmentsFileUpFolder);
-        }
-
-
         if (!deleteStatus) {
             throw new CouchbaseLiteException("Was not able to delete the database file", Status.INTERNAL_SERVER_ERROR);
         }
@@ -456,6 +469,10 @@ public final class Database {
         return getDocument(Misc.TDCreateUUID());
     }
 
+    private Document cachedDocumentWithID(String documentId){
+        return docCache.resourceWithCacheKeyDontRecache(documentId);
+    }
+
     /**
      * Returns the contents of the local document with the given ID, or nil if none exists.
      */
@@ -485,7 +502,7 @@ public final class Database {
         if (properties == null) {
             deleted = true;
         }
-        RevisionInternal rev = new RevisionInternal(id, null, deleted, this);
+        RevisionInternal rev = new RevisionInternal(id, null, deleted);
 
         if (properties != null) {
             rev.setProperties(properties);
@@ -727,6 +744,22 @@ public final class Database {
     }
 
     /**
+     * @exclude
+     */
+    @InterfaceAudience.Private
+    public void addDatabaseListener(DatabaseListener listener) {
+        databaseListeners.addIfAbsent(listener);
+    }
+
+    /**
+     * @exclude
+     */
+    @InterfaceAudience.Private
+    public void removeDatabaseListener(DatabaseListener listener) {
+        databaseListeners.remove(listener);
+    }
+
+    /**
      * Returns a string representation of this database.
      */
     @InterfaceAudience.Public
@@ -770,6 +803,13 @@ public final class Database {
     @InterfaceAudience.Public
     public static interface ChangeListener {
         public void changed(ChangeEvent event);
+    }
+
+
+    @InterfaceAudience.Private
+    public static interface DatabaseListener {
+        // CBL_DatabaseWillCloseNotification
+        public void databaseClosing();
     }
 
     /**
@@ -852,7 +892,34 @@ public final class Database {
         if( lastDotPosition > 0 ) {
             attachmentStorePath = attachmentStorePath.substring(0, lastDotPosition);
         }
+        attachmentStorePath = attachmentStorePath + " attachments";
+        return attachmentStorePath;
+    }
+
+    /**
+     * @exclude
+     */
+    @InterfaceAudience.Private
+    private String getObsoletedAttachmentStorePath() {
+        String attachmentStorePath = path;
+        int lastDotPosition = attachmentStorePath.lastIndexOf('.');
+        if( lastDotPosition > 0 ) {
+            attachmentStorePath = attachmentStorePath.substring(0, lastDotPosition);
+        }
         attachmentStorePath = attachmentStorePath + File.separator + "attachments";
+        return attachmentStorePath;
+    }
+
+    /**
+     * @exclude
+     */
+    @InterfaceAudience.Private
+    private String getObsoletedAttachmentStoreParentPath() {
+        String attachmentStorePath = path;
+        int lastDotPosition = attachmentStorePath.lastIndexOf('.');
+        if( lastDotPosition > 0 ) {
+            attachmentStorePath = attachmentStorePath.substring(0, lastDotPosition);
+        }
         return attachmentStorePath;
     }
 
@@ -897,8 +964,8 @@ public final class Database {
      */
     @InterfaceAudience.Private
     public synchronized boolean open() {
-        
-        if(open) {
+
+        if (open) {
             return true;
         }
 
@@ -914,7 +981,7 @@ public final class Database {
         }
 
         // Stuff we need to initialize every time the sqliteDb opens:
-        if(!initialize("PRAGMA foreign_keys = ON;")) {
+        if (!initialize("PRAGMA foreign_keys = ON;")) {
             Log.e(Database.TAG, "Error turning on foreign keys");
             return false;
         }
@@ -923,194 +990,397 @@ public final class Database {
         int dbVersion = database.getVersion();
 
         // Incompatible version changes increment the hundreds' place:
-        if(dbVersion >= 100) {
+        if (dbVersion >= 200) {
             Log.e(Database.TAG, "Database: Database version (%d) is newer than I know how to work with", dbVersion);
             database.close();
             return false;
         }
 
-        if(dbVersion < 1) {
-            // First-time initialization:
-            // (Note: Declaring revs.sequence as AUTOINCREMENT means the values will always be
-            // monotonically increasing, never reused. See <http://www.sqlite.org/autoinc.html>)
-            if(!initialize(SCHEMA)) {
-                database.close();
-                return false;
-            }
-            dbVersion = 3;
+        boolean isNew = (dbVersion == 0);
+        boolean isSuccessful = false;
+
+        // BEGIN TRANSACTION
+        if (!beginTransaction()) {
+            database.close();
+            return false;
         }
-
-        if (dbVersion < 2) {
-            // Version 2: added attachments.revpos
-            String upgradeSql = "ALTER TABLE attachments ADD COLUMN revpos INTEGER DEFAULT 0; " +
-                                "PRAGMA user_version = 2";
-            if(!initialize(upgradeSql)) {
-                database.close();
-                return false;
-            }
-            dbVersion = 2;
-        }
-
-        if (dbVersion < 3) {
-            String upgradeSql = "CREATE TABLE localdocs ( " +
-                    "docid TEXT UNIQUE NOT NULL, " +
-                    "revid TEXT NOT NULL, " +
-                    "json BLOB); " +
-                    "CREATE INDEX localdocs_by_docid ON localdocs(docid); " +
-                    "PRAGMA user_version = 3";
-            if(!initialize(upgradeSql)) {
-                database.close();
-                return false;
-            }
-            dbVersion = 3;
-        }
-
-        if (dbVersion < 4) {
-            String upgradeSql = "CREATE TABLE info ( " +
-                    "key TEXT PRIMARY KEY, " +
-                    "value TEXT); " +
-                    "INSERT INTO INFO (key, value) VALUES ('privateUUID', '" + Misc.TDCreateUUID() + "'); " +
-                    "INSERT INTO INFO (key, value) VALUES ('publicUUID',  '" + Misc.TDCreateUUID() + "'); " +
-                    "PRAGMA user_version = 4";
-            if(!initialize(upgradeSql)) {
-                database.close();
-                return false;
-            }
-            dbVersion = 4;
-        }
-
-        if (dbVersion < 5) {
-            // Version 5: added encoding for attachments
-            String upgradeSql = "ALTER TABLE attachments ADD COLUMN encoding INTEGER DEFAULT 0; " +
-                    "ALTER TABLE attachments ADD COLUMN encoded_length INTEGER; " +
-                    "PRAGMA user_version = 5";
-            if (!initialize(upgradeSql)) {
-                database.close();
-                return false;
-            }
-            dbVersion = 5;
-        }
-
-
-        if (dbVersion < 6) {
-            // Version 6: enable Write-Ahead Log (WAL) <http://sqlite.org/wal.html>
-            // Not supported on Android, require SQLite 3.7.0
-            //String upgradeSql  = "PRAGMA journal_mode=WAL; " +
-            String upgradeSql  = "PRAGMA user_version = 6";
-            if (!initialize(upgradeSql)) {
-                database.close();
-                return false;
-            }
-            dbVersion = 6;
-        }
-
-        if (dbVersion < 7) {
-            // Version 7: enable full-text search
-            // Note: Apple's SQLite build does not support the icu or unicode61 tokenizers :(
-            // OPT: Could add compress/decompress functions to make stored content smaller
-            // Not supported on Android
-            //String upgradeSql = "CREATE VIRTUAL TABLE fulltext USING fts4(content, tokenize=unicodesn); " +
-            //"ALTER TABLE maps ADD COLUMN fulltext_id INTEGER; " +
-            //"CREATE INDEX IF NOT EXISTS maps_by_fulltext ON maps(fulltext_id); " +
-            //"CREATE TRIGGER del_fulltext DELETE ON maps WHEN old.fulltext_id not null " +
-            //"BEGIN DELETE FROM fulltext WHERE rowid=old.fulltext_id| END; " +
-            String upgradeSql = "PRAGMA user_version = 7";
-            if (!initialize(upgradeSql)) {
-                database.close();
-                return false;
-            }
-            dbVersion = 7;
-        }
-
-        // (Version 8 was an older version of the geo index)
-
-        if (dbVersion < 9) {
-            // Version 9: Add geo-query index
-            //String upgradeSql = "CREATE VIRTUAL TABLE bboxes USING rtree(rowid, x0, x1, y0, y1); " +
-            //"ALTER TABLE maps ADD COLUMN bbox_id INTEGER; " +
-            //"ALTER TABLE maps ADD COLUMN geokey BLOB; " +
-            //"CREATE TRIGGER del_bbox DELETE ON maps WHEN old.bbox_id not null " +
-            //"BEGIN DELETE FROM bboxes WHERE rowid=old.bbox_id| END; " +
-            String upgradeSql = "PRAGMA user_version = 9";
-            if (!initialize(upgradeSql)) {
-                database.close();
-                return false;
-            }
-            dbVersion = 9;
-        }
-
-        if (dbVersion < 10) {
-            // Version 10: Add rev flag for whether it has an attachment
-            String upgradeSql =  "ALTER TABLE revs ADD COLUMN no_attachments BOOLEAN; " +
-                    "PRAGMA user_version = 10";
-            if (!initialize(upgradeSql)) {
-                database.close();
-                return false;
-            }
-            dbVersion = 10;
-        }
-
-        // (Version 11 used to create the index revs_cur_deleted, which is obsoleted in version 16)
-
-        // TODO: had to skip 12, because the bugfix has not been ported to android yet.
-        // TODO: See https://github.com/couchbase/couchbase-lite-ios/commit/a33d6ef3acc61fbc99deedd5658dc5ee897bd399
-        // TODO: once it's ported, it can be added onto the end
-
-
-        if (dbVersion < 13) {
-            // Version 13: Add rows to track number of rows in the views
-            String upgradeSql =  "ALTER TABLE views ADD COLUMN total_docs INTEGER DEFAULT -1; " +
-                    "PRAGMA user_version = 13";
-            if (!initialize(upgradeSql)) {
-                database.close();
-                return false;
-            }
-            dbVersion = 13;
-        }
-
-        if (dbVersion < 14) {
-            // Version 14: Add index for getting a document with doc and rev id
-            String upgradeSql =  "CREATE INDEX IF NOT EXISTS revs_by_docid_revid ON revs(doc_id, revid desc, current, deleted); " +
-                    "PRAGMA user_version = 14";
-            if (!initialize(upgradeSql)) {
-                database.close();
-                return false;
-            }
-            dbVersion = 14;
-        }
-
-        if (dbVersion < 15) {
-            // Version 15: Add sequence index on maps and attachments for revs(sequence) on DELETE CASCADE
-            String upgradeSql =  "CREATE INDEX maps_sequence ON maps(sequence); " +
-                    "CREATE INDEX attachments_sequence ON attachments(sequence); " +
-                    "PRAGMA user_version = 15";
-            if (!initialize(upgradeSql)) {
-                database.close();
-                return false;
-            }
-            dbVersion = 15;
-        }
-
-
-        if (dbVersion < 16) {
-            // Version 16: Fix the very suboptimal index revs_cur_deleted.
-            // The new revs_current is an optimal index for finding the winning revision of a doc.
-            String upgradeSql =  "DROP INDEX IF EXISTS revs_current; " +
-                    "DROP INDEX IF EXISTS revs_cur_deleted; " +
-                    "CREATE INDEX revs_current ON revs(doc_id, current desc, deleted, revid desc);" +
-                    "PRAGMA user_version = 16";
-
-            if (!initialize(upgradeSql)) {
-                database.close();
-                return false;
-            }
-            dbVersion = 16;
-        }
-
-
 
         try {
-            attachments = new BlobStore(getAttachmentStorePath());
+            if (dbVersion < 1) {
+                // First-time initialization:
+                // (Note: Declaring revs.sequence as AUTOINCREMENT means the values will always be
+                // monotonically increasing, never reused. See <http://www.sqlite.org/autoinc.html>)
+                if (!initialize(SCHEMA)) {
+                    return false;
+                }
+                dbVersion = 3;
+            }
+
+            if (dbVersion < 2) {
+                // Version 2: added attachments.revpos
+                String upgradeSql = "ALTER TABLE attachments ADD COLUMN revpos INTEGER DEFAULT 0; " +
+                        "PRAGMA user_version = 2";
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+                dbVersion = 2;
+            }
+
+            if (dbVersion < 3) {
+                String upgradeSql = "CREATE TABLE IF NOT EXISTS localdocs ( " +
+                        "docid TEXT UNIQUE NOT NULL, " +
+                        "revid TEXT NOT NULL, " +
+                        "json BLOB); " +
+                        "CREATE INDEX IF NOT EXISTS localdocs_by_docid ON localdocs(docid); " +
+                        "PRAGMA user_version = 3";
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+                dbVersion = 3;
+            }
+
+            if (dbVersion < 4) {
+                String upgradeSql = "CREATE TABLE info ( " +
+                        "key TEXT PRIMARY KEY, " +
+                        "value TEXT); " +
+                        "INSERT INTO INFO (key, value) VALUES ('privateUUID', '" + Misc.TDCreateUUID() + "'); " +
+                        "INSERT INTO INFO (key, value) VALUES ('publicUUID',  '" + Misc.TDCreateUUID() + "'); " +
+                        "PRAGMA user_version = 4";
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+                dbVersion = 4;
+            }
+
+            if (dbVersion < 5) {
+                // Version 5: added encoding for attachments
+                String upgradeSql = "ALTER TABLE attachments ADD COLUMN encoding INTEGER DEFAULT 0; " +
+                        "ALTER TABLE attachments ADD COLUMN encoded_length INTEGER; " +
+                        "PRAGMA user_version = 5";
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+                dbVersion = 5;
+            }
+
+
+            if (dbVersion < 6) {
+                // Version 6: enable Write-Ahead Log (WAL) <http://sqlite.org/wal.html>
+                // Not supported on Android, require SQLite 3.7.0
+                //String upgradeSql  = "PRAGMA journal_mode=WAL; " +
+
+                // NOTE: For Android, WAL should be set when open the database
+                //       Check AndroidSQLiteStorageEngine.java public boolean open(String path) method.
+                //       http://developer.android.com/reference/android/database/sqlite/SQLiteDatabase.html#enableWriteAheadLogging()
+
+                String upgradeSql = "PRAGMA user_version = 6";
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+                dbVersion = 6;
+            }
+
+            if (dbVersion < 7) {
+                // Version 7: enable full-text search
+                // Note: Apple's SQLite build does not support the icu or unicode61 tokenizers :(
+                // OPT: Could add compress/decompress functions to make stored content smaller
+                // Not supported on Android
+                //String upgradeSql = "CREATE VIRTUAL TABLE fulltext USING fts4(content, tokenize=unicodesn); " +
+                //"ALTER TABLE maps ADD COLUMN fulltext_id INTEGER; " +
+                //"CREATE INDEX IF NOT EXISTS maps_by_fulltext ON maps(fulltext_id); " +
+                //"CREATE TRIGGER del_fulltext DELETE ON maps WHEN old.fulltext_id not null " +
+                //"BEGIN DELETE FROM fulltext WHERE rowid=old.fulltext_id| END; " +
+                String upgradeSql = "PRAGMA user_version = 7";
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+                dbVersion = 7;
+            }
+
+            // (Version 8 was an older version of the geo index)
+
+            if (dbVersion < 9) {
+                // Version 9: Add geo-query index
+                //String upgradeSql = "CREATE VIRTUAL TABLE bboxes USING rtree(rowid, x0, x1, y0, y1); " +
+                //"ALTER TABLE maps ADD COLUMN bbox_id INTEGER; " +
+                //"ALTER TABLE maps ADD COLUMN geokey BLOB; " +
+                //"CREATE TRIGGER del_bbox DELETE ON maps WHEN old.bbox_id not null " +
+                //"BEGIN DELETE FROM bboxes WHERE rowid=old.bbox_id| END; " +
+                String upgradeSql = "PRAGMA user_version = 9";
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+                dbVersion = 9;
+            }
+
+            if (dbVersion < 10) {
+                // Version 10: Add rev flag for whether it has an attachment
+                String upgradeSql = "ALTER TABLE revs ADD COLUMN no_attachments BOOLEAN; " +
+                        "PRAGMA user_version = 10";
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+                dbVersion = 10;
+            }
+
+            // (Version 11 used to create the index revs_cur_deleted, which is obsoleted in version 16)
+
+            // (Version 12: CBL Android/Java skipped 12 before. Instead, we ported bug fix at dbVersion 18)
+
+            if (dbVersion < 13) {
+                // Version 13: Add rows to track number of rows in the views
+                String upgradeSql = "ALTER TABLE views ADD COLUMN total_docs INTEGER DEFAULT -1; " +
+                        "PRAGMA user_version = 13";
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+                dbVersion = 13;
+            }
+
+            if (dbVersion < 14) {
+                // Version 14: Add index for getting a document with doc and rev id
+                String upgradeSql = "CREATE INDEX IF NOT EXISTS revs_by_docid_revid ON revs(doc_id, revid desc, current, deleted); " +
+                        "PRAGMA user_version = 14";
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+                dbVersion = 14;
+            }
+
+            if (dbVersion < 15) {
+                // Version 15: Add sequence index on maps and attachments for revs(sequence) on DELETE CASCADE
+                String upgradeSql = "CREATE INDEX maps_sequence ON maps(sequence); " +
+                        "CREATE INDEX attachments_sequence ON attachments(sequence); " +
+                        "PRAGMA user_version = 15";
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+                dbVersion = 15;
+            }
+
+
+            if (dbVersion < 16) {
+                // Version 16: Fix the very suboptimal index revs_cur_deleted.
+                // The new revs_current is an optimal index for finding the winning revision of a doc.
+                String upgradeSql = "DROP INDEX IF EXISTS revs_current; " +
+                        "DROP INDEX IF EXISTS revs_cur_deleted; " +
+                        "CREATE INDEX revs_current ON revs(doc_id, current desc, deleted, revid desc);" +
+                        "PRAGMA user_version = 16";
+
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+                dbVersion = 16;
+            }
+
+            if (dbVersion < 17) {
+                // Version 17: https://github.com/couchbase/couchbase-lite-ios/issues/615
+                String upgradeSql = "CREATE INDEX maps_view_sequence ON maps(view_id, sequence); " +
+                        "PRAGMA user_version = 17";
+
+                if (!initialize(upgradeSql)) {
+                    database.close();
+                    return false;
+                }
+                dbVersion = 17;
+            }
+
+            // Note: We skipped change for dbVersion 12 before. 18 is for JSONCollator bug fix.
+            //       Android version should be one version higher.
+            if (dbVersion < 18) {
+                // Version 12: Because of a bug fix that changes JSON collation, invalidate view indexes
+
+                // instead of delete all rows in maps table, drop table and recreate it.
+                String upgradeSql = "DROP TABLE maps";
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+
+                upgradeSql = "CREATE TABLE IF NOT EXISTS maps ( " +
+                    " view_id INTEGER NOT NULL REFERENCES views(view_id) ON DELETE CASCADE, " +
+                    " sequence INTEGER NOT NULL REFERENCES revs(sequence) ON DELETE CASCADE, " +
+                    " key TEXT NOT NULL COLLATE JSON, " +
+                    " value TEXT); " +
+                    " CREATE INDEX IF NOT EXISTS maps_keys on maps(view_id, key COLLATE JSON); " +
+                    " CREATE INDEX IF NOT EXISTS maps_sequence ON maps(sequence);";
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+
+                upgradeSql = "UPDATE views SET lastsequence=0; " +
+                        "PRAGMA user_version = 18";
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+                dbVersion = 18;
+            }
+
+            // NOTE: Following lines of code are for compatibility with Couchbase Lite iOS v1.1.0 database format.
+            //       https://github.com/couchbase/couchbase-lite-java-core/issues/596
+            //       CBL iOS v1.1.0 => 101
+            //       1. Creates attachments table if it does not exist.
+            //       2. Iterate revs table to populate attachments table.
+            if (dbVersion >= 101) {
+
+                // NOTE: CBL iOS v1.1.0 does not have maps table, Needs to create it if it does not exist.
+                String upgradeSql = "CREATE TABLE IF NOT EXISTS maps ( " +
+                        " view_id INTEGER NOT NULL REFERENCES views(view_id) ON DELETE CASCADE, " +
+                        " sequence INTEGER NOT NULL REFERENCES revs(sequence) ON DELETE CASCADE, " +
+                        " key TEXT NOT NULL COLLATE JSON, " +
+                        " value TEXT); " +
+                        " CREATE INDEX IF NOT EXISTS maps_keys on maps(view_id, key COLLATE JSON); " +
+                        " CREATE INDEX IF NOT EXISTS maps_sequence ON maps(sequence);";
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+
+
+                // Check if attachments table exists. If not, create the table, and iterate revs
+                // to populate attachment table
+                boolean existsAttachments = false;
+                Cursor cursor = null;
+                try {
+                    cursor = database.rawQuery("SELECT name FROM sqlite_master WHERE type='table' AND name='attachments'", null);
+                    if (cursor.moveToNext()) {
+                        existsAttachments = true;
+                    }
+                } catch (SQLException e) {
+                    Log.e(Database.TAG, "Failed to check if attachments table exists", e);
+                    return false;
+                } finally {
+                    if (cursor != null) {
+                        cursor.close();
+                    }
+                }
+
+                if (!existsAttachments) {
+                    // 1. create attachments table
+                    upgradeSql = "CREATE TABLE attachments ( " +
+                            "sequence INTEGER NOT NULL REFERENCES revs(sequence) ON DELETE CASCADE, " +
+                            "filename TEXT NOT NULL, " +
+                            "key BLOB NOT NULL, " +
+                            "type TEXT, " +
+                            "length INTEGER NOT NULL, " +
+                            "encoding INTEGER DEFAULT 0, " +
+                            "encoded_length INTEGER, " +
+                            "revpos INTEGER DEFAULT 0); " +
+                            "CREATE INDEX attachments_by_sequence on attachments(sequence, filename); " +
+                            "CREATE INDEX attachments_sequence ON attachments(sequence); " +
+                            "PRAGMA user_version = 20";
+                    if (!initialize(upgradeSql)) {
+                        return false;
+                    }
+
+                    // 2. iterate revs table, and populate attachment table
+                    String sql = "SELECT sequence, json FROM revs WHERE no_attachments=0";
+                    Cursor cursor2 = null;
+                    try {
+                        cursor2 = database.rawQuery(sql, null);
+                        while (cursor2.moveToNext()) {
+                            if (!cursor2.isNull(1)) {
+                                long sequence = cursor2.getLong(0);
+                                byte[] json = cursor2.getBlob(1);
+                                try {
+                                    Map<String, Object> docProperties = Manager.getObjectMapper().readValue(json, Map.class);
+                                    Map<String, Object> attachments = (Map<String, Object>) docProperties.get("_attachments");
+                                    Iterator<String> itr = attachments.keySet().iterator();
+                                    while (itr.hasNext()) {
+                                        String name = itr.next();
+                                        Map<String, Object> attachment = (Map<String, Object>) attachments.get(name);
+                                        String contentType = (String) attachment.get("content_type");
+                                        int revPos = (Integer) attachment.get("revpos");
+                                        int length = (Integer) attachment.get("length");
+                                        String digest = (String) attachment.get("digest");
+                                        int encodedLength = -1;
+                                        if(attachment.containsKey("encoded_length"))
+                                            encodedLength = (Integer)attachment.get("encoded_length");
+                                        AttachmentInternal.AttachmentEncoding encoding = AttachmentInternal.AttachmentEncoding.AttachmentEncodingNone;
+                                        if(attachment.containsKey("encoding") && attachment.get("encoding").equals("gzip")){
+                                            encoding = AttachmentInternal.AttachmentEncoding.AttachmentEncodingGZIP;
+                                        }
+                                        BlobKey key = new BlobKey(digest);
+                                        try {
+                                            insertAttachmentForSequenceWithNameAndType(sequence, name, contentType, revPos, key, length, encoding, encodedLength);
+                                        } catch (CouchbaseLiteException e) {
+                                            Log.e(Log.TAG_DATABASE, "Attachment information inserstion error: " + name + "=" + attachment.toString(), e);
+                                            return false;
+                                        }
+                                    }
+                                } catch (Exception e) {
+                                    Log.e(Log.TAG_DATABASE, "JSON parsing error: " + new String(json), e);
+                                    return false;
+                                }
+                            }
+                        }
+                    } catch (SQLException e) {
+                        Log.e(Database.TAG, "Failed to check if attachments table exists", e);
+                        return false;
+                    } finally {
+                        if (cursor2 != null) {
+                            cursor2.close();
+                        }
+                    }
+                }
+                dbVersion = 20;
+            }
+
+            // NOTE: CBL Android/Java v1.1.0 Set database version 20.
+            //       20 is higher than any previous release, but lower than CBL iOS v1.1.0 - 101
+            if (dbVersion < 20) {
+                String upgradeSql = "PRAGMA user_version = 20";
+                if (!initialize(upgradeSql)) {
+                    return false;
+                }
+                dbVersion = 20;
+            }
+
+            if (isNew) {
+                optimizeSQLIndexes(); // runs ANALYZE query
+            }
+
+            // successfully updated database schema
+            isSuccessful = true;
+
+        } finally {
+            // END TRANSACTION WITH COMMIT OR ROLLBACK
+            endTransaction(isSuccessful);
+
+            // if failed, close database before return
+            if (!isSuccessful) {
+                database.close();
+            }
+        }
+
+        // NOTE: Migrate attachment directory path if necessary
+        // https://github.com/couchbase/couchbase-lite-java-core/issues/604
+        File obsoletedAttachmentStorePath = new File(getObsoletedAttachmentStorePath());
+        if (obsoletedAttachmentStorePath != null && obsoletedAttachmentStorePath.exists() && obsoletedAttachmentStorePath.isDirectory()) {
+            File attachmentStorePath = new File(getAttachmentStorePath());
+            if (attachmentStorePath != null && !attachmentStorePath.exists()) {
+                boolean success = obsoletedAttachmentStorePath.renameTo(attachmentStorePath);
+                if (!success) {
+                    Log.e(Database.TAG, "Could not rename attachment store path");
+                    database.close();
+                    return false;
+                }
+            }
+        }
+
+        // NOTE: obsoleted directory is /files/<database name>/attachments/xxxx
+        //       Needs to delete /files/<database name>/ too
+        File obsoletedAttachmentStoreParentPath = new File(getObsoletedAttachmentStoreParentPath());
+        if (obsoletedAttachmentStoreParentPath != null && obsoletedAttachmentStoreParentPath.exists()) {
+            obsoletedAttachmentStoreParentPath.delete();
+        }
+
+        try {
+            if (isBlobstoreMigrated() || !manager.isAutoMigrateBlobStoreFilename()) {
+                attachments = new BlobStore(getAttachmentStorePath(), false);
+            } else {
+                attachments = new BlobStore(getAttachmentStorePath(), true);
+                markBlobstoreMigrated();
+            }
+
         } catch (IllegalArgumentException e) {
             Log.e(Database.TAG, "Could not initialize attachment store", e);
             database.close();
@@ -1121,36 +1391,82 @@ public final class Database {
         return true;
     }
 
-    /**
-     * @exclude
-     */
-    @InterfaceAudience.Private
+    private boolean isBlobstoreMigrated() {
+        Map<String, Object> props = getExistingLocalDocument("_blobstore");
+        if (props != null && props.containsKey("blobstoreMigrated"))
+            return (Boolean) props.get("blobstoreMigrated");
+        return false;
+    }
+
+    private void markBlobstoreMigrated() {
+        Map<String, Object> props = new HashMap<String, Object>();
+        props.put("blobstoreMigrated", true);
+        try {
+            putLocalDocument("_blobstore", props);
+        } catch (CouchbaseLiteException e) {
+            Log.e(Log.TAG_DATABASE, e.getMessage());
+        }
+    }
+
+    @InterfaceAudience.Public
     public boolean close() {
-        if(!open) {
+        if (!open) {
             return false;
         }
 
-        if(views != null) {
+        for(DatabaseListener listener : databaseListeners){
+            listener.databaseClosing();
+        }
+
+        if (views != null) {
             for (View view : views.values()) {
                 view.databaseClosing();
             }
         }
         views = null;
 
-        if(activeReplicators != null) {
-            for(Replication replicator : activeReplicators) {
-                replicator.databaseClosing();
+        if (activeReplicators != null) {
+            List<CountDownLatch> latches = new ArrayList<CountDownLatch>();
+            synchronized (activeReplicators) {
+                for (Replication replicator : activeReplicators) {
+                    // handler to check if the replicator stopped
+                    final CountDownLatch latch = new CountDownLatch(1);
+                    replicator.addChangeListener(new Replication.ChangeListener() {
+                        @Override
+                        public void changed(Replication.ChangeEvent event) {
+                            if (event.getSource().getStatus() == Replication.ReplicationStatus.REPLICATION_STOPPED) {
+                                latch.countDown();
+                            }
+                        }
+                    });
+                    latches.add(latch);
+
+                    // ask replicator to stop
+                    replicator.databaseClosing();
+                }
             }
+
+            // wait till all replicator stopped
+            for (CountDownLatch latch : latches) {
+                try {
+                    boolean success = latch.await(Replication.DEFAULT_MAX_TIMEOUT_FOR_SHUTDOWN, TimeUnit.SECONDS);
+                    if (!success) {
+                        Log.w(Log.TAG_DATABASE, "Replicator could not stop in " + Replication.DEFAULT_MAX_TIMEOUT_FOR_SHUTDOWN + " second.");
+                    }
+                } catch (Exception e) {
+                    Log.w(Log.TAG_DATABASE, e.getMessage());
+                }
+            }
+
             activeReplicators = null;
         }
 
         allReplicators = null;
 
-        if(database != null && database.isOpen()) {
+        if (database != null && database.isOpen()) {
             database.close();
         }
         open = false;
-        transactionLevel = 0;
         return true;
     }
 
@@ -1203,16 +1519,39 @@ public final class Database {
     /**
      * Begins a database transaction. Transactions can nest.
      * Every beginTransaction() must be balanced by a later endTransaction()
+     *
+     * Notes: 1. SQLiteDatabase.beginTransaction() supported nested transaction. But, in case
+     *           nested transaction rollbacked, it also rollbacks outer transaction too.
+     *           This is not ideal behavior for CBL
+     *        2. SAVEPOINT...RELEASE supports nested transaction. But Android API 14 and 15,
+     *           it throws Exception. I assume it is Android bug. As CBL need to support from API 10
+     *           . So it does not work for CBL.
+     *        3. Using Transaction for outer/1st level of transaction and inner/2nd level of transaction
+     *           works with CBL requirement.
+     *        4. CBL Android and Java uses Thread, So it is better to use SQLiteDatabase.beginTransaction()
+     *           for outer/1st level transaction. if we use BEGIN...COMMIT and SAVEPOINT...RELEASE,
+     *           we need to implement wrapper of BEGIN...COMMIT and SAVEPOINT...RELEASE to be
+     *           Thread-safe.
+     *
      * @exclude
      */
     @InterfaceAudience.Private
     public boolean beginTransaction() {
+        int tLevel = transactionLevel.get();
+        //Log.v(Log.TAG_DATABASE, "[Database.beginTransaction()] Database=" + this + ", SQLiteStorageEngine=" + database + ", transactionLevel=" + transactionLevel + ", currentThread=" + Thread.currentThread());
         try {
-            database.beginTransaction();
-            ++transactionLevel;
-            Log.i(Log.TAG, "%s Begin transaction (level %d)", Thread.currentThread().getName(), transactionLevel);
+            // Outer (level 0)  transaction. Use SQLiteDatabase.beginTransaction()
+            if (tLevel == 0) {
+                database.beginTransaction();
+            }
+            // Inner (level 1 or higher) transaction. Use SQLite's SAVEPOINT
+            else {
+                database.execSQL("SAVEPOINT cbl_" + Integer.toString(tLevel));
+            }
+            Log.v(Log.TAG_DATABASE, "%s Begin transaction (level %d)", Thread.currentThread().getName(), tLevel);
+            transactionLevel.set(++tLevel);
         } catch (SQLException e) {
-            Log.e(Database.TAG, Thread.currentThread().getName() + " Error calling beginTransaction()", e);
+            Log.e(Log.TAG_DATABASE, Thread.currentThread().getName() + " Error calling beginTransaction()", e);
             return false;
         }
         return true;
@@ -1226,27 +1565,50 @@ public final class Database {
      */
     @InterfaceAudience.Private
     public boolean endTransaction(boolean commit) {
+        int tLevel = transactionLevel.get();
 
-        assert(transactionLevel > 0);
+        assert (tLevel > 0);
 
-        if(commit) {
-            Log.i(Log.TAG, "%s Committing transaction (level %d)", Thread.currentThread().getName(), transactionLevel);
-            database.setTransactionSuccessful();
-            database.endTransaction();
-        }
-        else {
-            Log.i(Log.TAG, "%s CANCEL transaction (level %d)", Thread.currentThread().getName(), transactionLevel);
-            try {
+        transactionLevel.set(--tLevel);
+
+        // Outer (level 0) transaction. Use SQLiteDatabase.setTransactionSuccessful() and SQLiteDatabase.endTransaction()
+        if (tLevel == 0) {
+            if (commit) {
+                Log.v(Log.TAG_DATABASE, "%s Committing transaction (level %d)", Thread.currentThread().getName(), tLevel);
+                database.setTransactionSuccessful();
                 database.endTransaction();
+            } else {
+                Log.v(Log.TAG_DATABASE, "%s CANCEL transaction (level %d)", Thread.currentThread().getName(), tLevel);
+                try {
+                    database.endTransaction();
+                } catch (SQLException e) {
+                    Log.e(Log.TAG_DATABASE, Thread.currentThread().getName() + " Error calling endTransaction()", e);
+                    return false;
+                }
+            }
+        }
+        // Inner (level 1 or higher) transaction: Use SQLite's ROLLBACK and RELEASE
+        else {
+            if (commit) {
+                Log.v(Log.TAG_DATABASE, "%s Committing transaction (level %d)", Thread.currentThread().getName(), tLevel);
+            } else {
+                Log.v(Log.TAG_DATABASE, "%s CANCEL transaction (level %d)", Thread.currentThread().getName(), tLevel);
+                try {
+                    database.execSQL(";ROLLBACK TO cbl_" + Integer.toString(tLevel));
+                } catch (SQLException e) {
+                    Log.e(Log.TAG_DATABASE, Thread.currentThread().getName() + " Error calling endTransaction()", e);
+                    return false;
+                }
+            }
+            try {
+                database.execSQL("RELEASE cbl_" + Integer.toString(tLevel));
             } catch (SQLException e) {
-                Log.e(Database.TAG, Thread.currentThread().getName() + " Error calling endTransaction()", e);
+                Log.e(Log.TAG_DATABASE, Thread.currentThread().getName() + " Error calling endTransaction()", e);
                 return false;
             }
         }
 
-        --transactionLevel;
-        postChangeNotifications();
-
+        storageExitedTransaction(commit);
 
         return true;
     }
@@ -1291,6 +1653,47 @@ public final class Database {
             if(cursor != null) {
                 cursor.close();
             }
+        }
+        return result;
+    }
+
+    /**
+     * @exclude
+     */
+    @InterfaceAudience.Private
+    public String infoForKey(String key) {
+        String result = null;
+        Cursor cursor = null;
+        try {
+            String[] args = {key};
+            cursor = database.rawQuery("SELECT value FROM info WHERE key=?", args);
+            if (cursor.moveToNext()) {
+                result = cursor.getString(0);
+            }
+        } catch (SQLException e) {
+            Log.e(TAG, "Error querying " + key, e);
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @exclude
+     */
+    @InterfaceAudience.Private
+    public long setInfo(String key, String info) {
+        long result = 0;
+        try {
+            ContentValues args = new ContentValues();
+            args.put("key", key);
+            args.put("value", info);
+            result = database.insertWithOnConflict("info", null, args, SQLiteStorageEngine.CONFLICT_REPLACE);
+
+        } catch (Exception e) {
+            Log.e(Database.TAG, "Error inserting document id", e);
         }
         return result;
     }
@@ -1444,7 +1847,7 @@ public final class Database {
     @InterfaceAudience.Private
     public Map<String, Object> documentPropertiesFromJSON(byte[] json, String docId, String revId, boolean deleted, long sequence, EnumSet<TDContentOptions> contentOptions) {
 
-        RevisionInternal rev = new RevisionInternal(docId, revId, deleted, this);
+        RevisionInternal rev = new RevisionInternal(docId, revId, deleted);
         rev.setSequence(sequence);
         Map<String, Object> extra = extraPropertiesForRevision(rev, contentOptions);
         if (json == null) {
@@ -1496,7 +1899,7 @@ public final class Database {
                     rev = cursor.getString(0);
                 }
                 boolean deleted = (cursor.getInt(1) > 0);
-                result = new RevisionInternal(id, rev, deleted, this);
+                result = new RevisionInternal(id, rev, deleted);
                 result.setSequence(cursor.getLong(2));
                 if(!contentOptions.equals(EnumSet.of(TDContentOptions.TDNoBody))) {
                     byte[] json = null;
@@ -1531,11 +1934,11 @@ public final class Database {
      */
     @InterfaceAudience.Private
     public RevisionInternal loadRevisionBody(RevisionInternal rev, EnumSet<TDContentOptions> contentOptions) throws CouchbaseLiteException {
-        if(rev.getBody() != null && contentOptions == EnumSet.noneOf(Database.TDContentOptions.class) && rev.getSequence() != 0) {
+        if (rev.getBody() != null && contentOptions == EnumSet.noneOf(TDContentOptions.class) && rev.getSequence() != 0) {
             return rev;
         }
 
-        if((rev.getDocId() == null) || (rev.getRevId() == null)) {
+        if ((rev.getDocId() == null) || (rev.getRevId() == null)) {
             Log.e(Database.TAG, "Error loading revision body");
             throw new CouchbaseLiteException(Status.PRECONDITION_FAILED);
         }
@@ -1546,18 +1949,18 @@ public final class Database {
             // TODO: on ios this query is:
             // TODO: "SELECT sequence, json FROM revs WHERE doc_id=? AND revid=? LIMIT 1"
             String sql = "SELECT sequence, json FROM revs, docs WHERE revid=? AND docs.docid=? AND revs.doc_id=docs.doc_id LIMIT 1";
-            String[] args = { rev.getRevId(), rev.getDocId()};
+            String[] args = {rev.getRevId(), rev.getDocId()};
             cursor = database.rawQuery(sql, args);
-            if(cursor.moveToNext()) {
+            if (cursor.moveToNext()) {
                 result.setCode(Status.OK);
                 rev.setSequence(cursor.getLong(0));
                 expandStoredJSONIntoRevisionWithAttachments(cursor.getBlob(1), rev, contentOptions);
             }
-        } catch(SQLException e) {
+        } catch (SQLException e) {
             Log.e(Database.TAG, "Error loading revision body", e);
             throw new CouchbaseLiteException(Status.INTERNAL_SERVER_ERROR);
         } finally {
-            if(cursor != null) {
+            if (cursor != null) {
                 cursor.close();
             }
         }
@@ -1627,7 +2030,7 @@ public final class Database {
             cursor.moveToNext();
             result = new RevisionList();
             while(!cursor.isAfterLast()) {
-                RevisionInternal rev = new RevisionInternal(docId, cursor.getString(1), (cursor.getInt(2) > 0), this);
+                RevisionInternal rev = new RevisionInternal(docId, cursor.getString(1), (cursor.getInt(2) > 0));
                 rev.setSequence(cursor.getLong(0));
                 result.add(rev);
                 cursor.moveToNext();
@@ -1699,15 +2102,9 @@ public final class Database {
      * @exclude
      */
     @InterfaceAudience.Private
-    public List<String>  getPossibleAncestorRevisionIDs (
-            RevisionInternal rev,
-            int limit,
-            AtomicBoolean hasAttachment
-            ) {
-
-        List<String> matchingRevs = new ArrayList<String>();
+    public List<String>  getPossibleAncestorRevisionIDs( RevisionInternal rev, int limit, AtomicBoolean hasAttachment )
+    {
         int generation = rev.getGeneration();
-
         if (generation <= 1)
             return null;
 
@@ -1715,30 +2112,33 @@ public final class Database {
         if (docNumericID <= 0)
             return null;
 
+        List<String> revIDs = new ArrayList<String>();
+
         int sqlLimit = limit > 0 ? (int)limit : -1;     // SQL uses -1, not 0, to denote 'no limit'
         String sql = "SELECT revid, sequence FROM revs WHERE doc_id=? and revid < ?" +
         " and deleted=0 and json not null" +
         " ORDER BY sequence DESC LIMIT ?";
         String[] args = {Long.toString(docNumericID),generation+"-",Integer.toString(sqlLimit)};
 
-            Cursor cursor = null;
-            try {
-                cursor = database.rawQuery(sql, args);
+        Cursor cursor = null;
+        try {
+            cursor = database.rawQuery(sql, args);
+            cursor.moveToNext();
+            while(!cursor.isAfterLast()){
+                if (hasAttachment != null && revIDs.size() == 0){
+                    hasAttachment.set(sequenceHasAttachments(cursor.getLong(1)));
+                }
+                revIDs.add(cursor.getString(0));
                 cursor.moveToNext();
-                if (!cursor.isAfterLast()) {
-                    if (matchingRevs.size() == 0)
-                        hasAttachment.set(sequenceHasAttachments(cursor.getLong(1)));
-                    matchingRevs.add(cursor.getString(0));
-                }
-
-            } catch (SQLException e) {
-                Log.e(Database.TAG, "Error getting all revisions of document", e);
-            } finally {
-                if (cursor != null) {
-                    cursor.close();
-                }
             }
-        return matchingRevs;
+        } catch (SQLException e) {
+            Log.e(Database.TAG, "Error getting all revisions of document", e);
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+        return revIDs;
     }
 
 
@@ -1823,7 +2223,7 @@ public final class Database {
                     revId = cursor.getString(2);
                     boolean deleted = (cursor.getInt(3) > 0);
                     boolean missing = (cursor.getInt(4) > 0);
-                    RevisionInternal aRev = new RevisionInternal(docId, revId, deleted, this);
+                    RevisionInternal aRev = new RevisionInternal(docId, revId, deleted);
                     aRev.setMissing(missing);
                     aRev.setSequence(cursor.getLong(0));
                     result.add(aRev);
@@ -1959,22 +2359,22 @@ public final class Database {
      * @exclude
      */
     @InterfaceAudience.Private
-    public RevisionList changesSince(long lastSeq, ChangesOptions options, ReplicationFilter filter) {
+    public RevisionList changesSince(long lastSeq, ChangesOptions options, ReplicationFilter filter, Map<String, Object> filterParams) {
         // http://wiki.apache.org/couchdb/HTTP_database_API#Changes
-        if(options == null) {
+        if (options == null) {
             options = new ChangesOptions();
         }
 
         boolean includeDocs = options.isIncludeDocs() || (filter != null);
-        String additionalSelectColumns =  "";
-        if(includeDocs) {
+        String additionalSelectColumns = "";
+        if (includeDocs) {
             additionalSelectColumns = ", json";
         }
 
         String sql = "SELECT sequence, revs.doc_id, docid, revid, deleted" + additionalSelectColumns + " FROM revs, docs "
-                        + "WHERE sequence > ? AND current=1 "
-                        + "AND revs.doc_id = docs.doc_id "
-                        + "ORDER BY revs.doc_id, revid DESC";
+                + "WHERE sequence > ? AND current=1 "
+                + "AND revs.doc_id = docs.doc_id "
+                + "ORDER BY revs.doc_id, revid DESC";
         String[] args = {Long.toString(lastSeq)};
         Cursor cursor = null;
         RevisionList changes = null;
@@ -1984,24 +2384,23 @@ public final class Database {
             cursor.moveToNext();
             changes = new RevisionList();
             long lastDocId = 0;
-            while(!cursor.isAfterLast()) {
-                if(!options.isIncludeConflicts()) {
+            while (!cursor.isAfterLast()) {
+                if (!options.isIncludeConflicts()) {
                     // Only count the first rev for a given doc (the rest will be losing conflicts):
                     long docNumericId = cursor.getLong(1);
-                    if(docNumericId == lastDocId) {
+                    if (docNumericId == lastDocId) {
                         cursor.moveToNext();
                         continue;
                     }
                     lastDocId = docNumericId;
                 }
 
-                RevisionInternal rev = new RevisionInternal(cursor.getString(2), cursor.getString(3), (cursor.getInt(4) > 0), this);
+                RevisionInternal rev = new RevisionInternal(cursor.getString(2), cursor.getString(3), (cursor.getInt(4) > 0));
                 rev.setSequence(cursor.getLong(0));
-                if(includeDocs) {
+                if (includeDocs) {
                     expandStoredJSONIntoRevisionWithAttachments(cursor.getBlob(5), rev, options.getContentOptions());
                 }
-                Map<String, Object> paramsFixMe = null;  // TODO: these should not be null
-                if (runFilter(filter, paramsFixMe, rev)) {
+                if (runFilter(filter, filterParams, rev)) {
                     changes.add(rev);
                 }
                 cursor.moveToNext();
@@ -2009,12 +2408,12 @@ public final class Database {
         } catch (SQLException e) {
             Log.e(Database.TAG, "Error looking for changes", e);
         } finally {
-            if(cursor != null) {
+            if (cursor != null) {
                 cursor.close();
             }
         }
 
-        if(options.isSortBySequence()) {
+        if (options.isSortBySequence()) {
             changes.sortBySequence();
         }
         changes.limit(options.getLimit());
@@ -2025,12 +2424,12 @@ public final class Database {
      * @exclude
      */
     @InterfaceAudience.Private
-    public boolean runFilter(ReplicationFilter filter, Map<String, Object> paramsIgnored, RevisionInternal rev) {
+    public boolean runFilter(ReplicationFilter filter, Map<String, Object> filterParams, RevisionInternal rev) {
         if (filter == null) {
             return true;
         }
         SavedRevision publicRev = new SavedRevision(this, rev);
-        return filter.filter(publicRev, null);
+        return filter.filter(publicRev, filterParams);
     }
 
     /**
@@ -2269,6 +2668,7 @@ public final class Database {
         }
         if (maxKey != null) {
             assert(maxKey instanceof String);
+            maxKey = View.keyForPrefixMatch(maxKey, options.getPrefixMatchLevel());
             sql.append((inclusiveMax ? " AND docid <= ?" :  " AND docid < ?"));
             args.add((String)maxKey);
         }
@@ -2332,7 +2732,9 @@ public final class Database {
                 change.setDatabase(this);
                 if (options.getKeys() != null) {
                     docs.put(docId, change);
-                } else {
+                }
+                // TODO: In the future, we need to implement CBLRowPassesFilter() in CBLView+Querying.m
+                else if (options.getPostFilter() == null || options.getPostFilter().apply(change)) {
                     rows.add(change);
                 }
             }
@@ -2391,6 +2793,12 @@ public final class Database {
     /**
      * Returns the rev ID of the 'winning' revision of this document, and whether it's deleted.
      * @exclude
+     *
+     * in CBLDatabase+Internal.m
+     * - (NSString*) winningRevIDOfDocNumericID: (SInt64)docNumericID
+     *                                isDeleted: (BOOL*)outIsDeleted
+     *                               isConflict: (BOOL*)outIsConflict // optional
+     *                                   status: (CBLStatus*)outStatus
      */
     @InterfaceAudience.Private
     String winningRevIDOfDoc(long docNumericId, AtomicBoolean outIsDeleted, AtomicBoolean outIsConflict) throws CouchbaseLiteException {
@@ -2447,10 +2855,15 @@ public final class Database {
                 attachment.getName(),
                 attachment.getContentType(),
                 attachment.getRevpos(),
-                attachment.getBlobKey());
+                attachment.getBlobKey(),
+                attachment.getLength(),
+                attachment.getEncoding(),
+                attachment.getEncodedLength());
     }
 
     /**
+     * Note: This method is used only from unit tests.
+     *
      * @exclude
      */
     @InterfaceAudience.Private
@@ -2475,23 +2888,34 @@ public final class Database {
      */
     @InterfaceAudience.Private
     public void insertAttachmentForSequenceWithNameAndType(long sequence, String name, String contentType, int revpos, BlobKey key) throws CouchbaseLiteException {
+        insertAttachmentForSequenceWithNameAndType(sequence, name, contentType, revpos, key, key != null ? attachments.getSizeOfBlob(key): -1, AttachmentInternal.AttachmentEncoding.AttachmentEncodingNone, -1);
+    }
+
+    private void insertAttachmentForSequenceWithNameAndType(long sequence, String name, String contentType, int revpos, BlobKey key, long length, AttachmentInternal.AttachmentEncoding encoding, long encodedLength) throws CouchbaseLiteException {
         try {
             ContentValues args = new ContentValues();
             args.put("sequence", sequence);
             args.put("filename", name);
-            if (key != null){
-                args.put("key", key.getBytes());
-                args.put("length", attachments.getSizeOfBlob(key));
-            }
             args.put("type", contentType);
             args.put("revpos", revpos);
+            if (key != null) {
+                args.put("key", key.getBytes());
+            }
+            if (length >= 0) {
+                args.put("length", length);
+            }
+            if(encoding == AttachmentInternal.AttachmentEncoding.AttachmentEncodingGZIP) {
+                args.put("encoding", encoding.ordinal());
+                if (encodedLength >= 0) {
+                    args.put("encoded_length", encodedLength);
+                }
+            }
             long result = database.insert("attachments", null, args);
             if (result == -1) {
                 String msg = "Insert attachment failed (returned -1)";
                 Log.e(Database.TAG, msg);
                 throw new CouchbaseLiteException(msg, Status.INTERNAL_SERVER_ERROR);
             }
-
         } catch (SQLException e) {
             Log.e(Database.TAG, "Error inserting attachment", e);
             throw new CouchbaseLiteException(e, Status.INTERNAL_SERVER_ERROR);
@@ -2507,6 +2931,7 @@ public final class Database {
         if (digest == null) {
             throw new CouchbaseLiteException(Status.BAD_ATTACHMENT);
         }
+
         if (pendingAttachmentsByDigest != null && pendingAttachmentsByDigest.containsKey(digest)) {
             BlobStoreWriter writer = pendingAttachmentsByDigest.get(digest);
             try {
@@ -2517,6 +2942,10 @@ public final class Database {
             } catch (Exception e) {
                 throw new CouchbaseLiteException(e, Status.STATUS_ATTACHMENT_ERROR);
             }
+        }
+        else{
+            Log.w(Database.TAG, "No pending attachment for digest: " + digest);
+            throw new CouchbaseLiteException(Status.BAD_ATTACHMENT);
         }
     }
 
@@ -2685,7 +3114,7 @@ public final class Database {
 
         String args[] = { Long.toString(sequence) };
         try {
-            cursor = database.rawQuery("SELECT filename, key, type, length, revpos FROM attachments WHERE sequence=?", args);
+            cursor = database.rawQuery("SELECT filename, key, type, encoding, length, encoded_length, revpos FROM attachments WHERE sequence=?", args);
 
             if(!cursor.moveToNext()) {
                 return null;
@@ -2696,7 +3125,10 @@ public final class Database {
             while(!cursor.isAfterLast()) {
 
                 boolean dataSuppressed = false;
-                int length = cursor.getInt(3);
+                int length = cursor.getInt(4);
+
+                AttachmentInternal.AttachmentEncoding encoding = AttachmentInternal.AttachmentEncoding.values()[cursor.getInt(3)];
+                int encodedLength = cursor.getInt(5);
 
                 byte[] keyData = cursor.getBlob(1);
                 BlobKey key = new BlobKey(keyData);
@@ -2709,39 +3141,42 @@ public final class Database {
                     }
                     else {
                         byte[] data = attachments.blobForKey(key);
-
                         if(data != null) {
                             dataBase64 = Base64.encodeBytes(data);  // <-- very expensive
                         }
                         else {
                             Log.w(Database.TAG, "Error loading attachment.  Sequence: %s", sequence);
                         }
-
                     }
+                }
 
+                String encodingStr = null;
+                if (encoding == AttachmentInternal.AttachmentEncoding.AttachmentEncodingGZIP) {
+                    // NOTE: iOS decode if attachment is included int the dict.
+                    encodingStr = "gzip";
                 }
 
                 Map<String, Object> attachment = new HashMap<String, Object>();
-
-
-
-                if(!(dataBase64 != null || dataSuppressed)) {
+                if (!(dataBase64 != null || dataSuppressed)) {
                     attachment.put("stub", true);
                 }
-
-                if(dataBase64 != null) {
+                if (dataBase64 != null) {
                     attachment.put("data", dataBase64);
                 }
-
                 if (dataSuppressed == true) {
                     attachment.put("follows", true);
                 }
-
                 attachment.put("digest", digestString);
                 String contentType = cursor.getString(2);
                 attachment.put("content_type", contentType);
+                if (encodingStr != null) {
+                    attachment.put("encoding", encodingStr);
+                }
                 attachment.put("length", length);
-                attachment.put("revpos", cursor.getInt(4));
+                if (encodingStr != null && encodedLength >= 0) {
+                    attachment.put("encoded_length", encodedLength);
+                }
+                attachment.put("revpos", cursor.getInt(6));
 
                 String filename = cursor.getString(0);
                 result.put(filename, attachment);
@@ -3002,7 +3437,7 @@ public final class Database {
 
         beginTransaction();
         try {
-            RevisionInternal oldRev = new RevisionInternal(docID, oldRevID, false, this);
+            RevisionInternal oldRev = new RevisionInternal(docID, oldRevID, false);
             if(oldRevID != null) {
 
                 // Load existing revision if this is a replacement:
@@ -3172,6 +3607,11 @@ public final class Database {
     }
 
     /**
+     * in CBLDatabase+Insertion.m
+     * - (NSString*) generateIDForRevision: (CBL_Revision*)rev
+     *                            withJSON: (NSData*)json
+     *                         attachments: (NSDictionary*)attachments
+     *                              prevID: (NSString*) prevID
      * @exclude
      */
     @InterfaceAudience.Private
@@ -3192,16 +3632,19 @@ public final class Database {
         // Generate a digest for this revision based on the previous revision ID, document JSON,
         // and attachment digests. This doesn't need to be secure; we just need to ensure that this
         // code consistently generates the same ID given equivalent revisions.
-
         try {
             md5Digest = MessageDigest.getInstance("MD5");
         } catch (NoSuchAlgorithmException e) {
             throw new RuntimeException(e);
         }
 
+        // single byte - length of previous revision id
+        // +
+        // previous revision id
         int length = 0;
+        byte[] prevIDUTF8 = null;
         if (previousRevisionId != null) {
-            byte[] prevIDUTF8 = previousRevisionId.getBytes(Charset.forName("UTF-8"));
+            prevIDUTF8 = previousRevisionId.getBytes(Charset.forName("UTF-8"));
             length = prevIDUTF8.length;
         }
         if (length > 0xFF) {
@@ -3209,13 +3652,17 @@ public final class Database {
         }
         byte lengthByte = (byte) (length & 0xFF);
         byte[] lengthBytes = new byte[] { lengthByte };
+        md5Digest.update(lengthBytes); // prefix with length byte
+        if (length > 0 && prevIDUTF8 != null) {
+            md5Digest.update(prevIDUTF8);
+        }
 
-        md5Digest.update(lengthBytes);
-
+        // single byte - deletion flag
         int isDeleted = ((rev.isDeleted() != false) ? 1 : 0);
         byte[] deletedByte = new byte[] { (byte) isDeleted };
         md5Digest.update(deletedByte);
 
+        // all attachment keys
         List<String> attachmentKeys = new ArrayList<String>(attachments.keySet());
         Collections.sort(attachmentKeys);
         for (String key : attachmentKeys) {
@@ -3223,6 +3670,7 @@ public final class Database {
             md5Digest.update(attachment.getBlobKey().getBytes());
         }
 
+        // json
         if (json != null) {
             md5Digest.update(json);
         }
@@ -3232,7 +3680,6 @@ public final class Database {
 
         int generationIncremented = generation + 1;
         return String.format("%d-%s", generationIncremented, digestAsHex).toLowerCase();
-
     }
 
     /**
@@ -3337,11 +3784,13 @@ public final class Database {
 
 
     @InterfaceAudience.Private
-    private void postChangeNotifications() {
+    private boolean postChangeNotifications() {
+        boolean posted = false;
+        int tLevel = transactionLevel.get();
         // This is a 'while' instead of an 'if' because when we finish posting notifications, there
         // might be new ones that have arrived as a result of notification handlers making document
         // changes of their own (the replicator manager will do this.) So we need to check again.
-        while (transactionLevel == 0 && isOpen() && !postingChangeNotifications
+        while (tLevel == 0 && isOpen() && !postingChangeNotifications
                 && changesToNotify.size() > 0)
         {
 
@@ -3352,21 +3801,14 @@ public final class Database {
                 outgoingChanges.addAll(changesToNotify);
                 changesToNotify.clear();
 
-                // TODO: change this to match iOS and call cachedDocumentWithID
-                /*
-                BOOL external = NO;
-                for (CBLDatabaseChange* change in changes) {
-                    // Notify the corresponding instantiated CBLDocument object (if any):
-                    [[self _cachedDocumentWithID: change.documentID] revisionAdded: change];
-                    if (change.source != nil)
-                        external = YES;
-                }
-                */
+                // TODO: postPublicChangeNotification in CBLDatabase+Internal.m should replace following lines of code.
 
                 boolean isExternal = false;
-                for (DocumentChange change: outgoingChanges) {
-                    Document document = getDocument(change.getDocumentId());
-                    document.revisionAdded(change);
+                for (DocumentChange change : outgoingChanges) {
+                    Document doc = cachedDocumentWithID(change.getDocumentId());
+                    if (doc != null) {
+                        doc.revisionAdded(change, true);
+                    }
                     if (change.getSourceUrl() != null) {
                         isExternal = true;
                     }
@@ -3378,49 +3820,65 @@ public final class Database {
                     changeListener.changed(changeEvent);
                 }
 
+                posted = true;
             } catch (Exception e) {
                 Log.e(Database.TAG, this + " got exception posting change notifications", e);
             } finally {
                 postingChangeNotifications = false;
             }
-
         }
-
-
-    }
-
-    private void notifyChange(DocumentChange documentChange) {
-        if (changesToNotify == null) {
-            changesToNotify = new ArrayList<DocumentChange>();
-        }
-        changesToNotify.add(documentChange);
-
-        postChangeNotifications();
-    }
-
-    private void notifyChanges(List<DocumentChange> documentChanges) {
-        if (changesToNotify == null) {
-            changesToNotify = new ArrayList<DocumentChange>();
-        }
-        changesToNotify.addAll(documentChanges);
-        postChangeNotifications();
+        return posted;
     }
 
     /**
-     * @exclude
+     * in CBLDatabase+Internal.m
+     * - (void) databaseStorageChanged:(CBLDatabaseChange *)change
      */
-    @InterfaceAudience.Private
-    public void notifyChange(RevisionInternal rev, RevisionInternal winningRev, URL source, boolean inConflict) {
+    private void databaseStorageChanged(DocumentChange change) {
+        Log.v(Log.TAG_DATABASE, "Added: " + change.getAddedRevision());
+        if (changesToNotify == null) {
+            changesToNotify = new ArrayList<DocumentChange>();
+        }
+        changesToNotify.add(change);
+        if (!postChangeNotifications()) {
+            // The notification wasn't posted yet, probably because a transaction is open.
+            // But the CBLDocument, if any, needs to know right away so it can update its
+            // currentRevision.
 
-        DocumentChange change = new DocumentChange(
-                rev,
-                winningRev,
-                inConflict,
-                source);
+            Document doc = cachedDocumentWithID(change.getDocumentId());
+            if (doc != null) {
+                doc.revisionAdded(change, false);
+            }
+        }
 
-        notifyChange(change);
+        // Squish the change objects if too many of them are piling up:
+        if (changesToNotify.size() >= MANY_CHANGES_TO_NOTIFY) {
+            if(changesToNotify.size() == MANY_CHANGES_TO_NOTIFY){
+                for(DocumentChange c : changesToNotify){
+                    c.reduceMemoryUsage();
+                }
+            }else{
+                change.reduceMemoryUsage();
+            }
+        }
+    }
 
-
+    /**
+     * in CBLDatabase+Internal.m
+     * - (void) storageExitedTransaction: (BOOL)committed
+     */
+    private void storageExitedTransaction(boolean committed) {
+        if (!committed) {
+            // I already told cached CBLDocuments about these new revisions. Back that out:
+            for (DocumentChange change : changesToNotify) {
+                Document doc = cachedDocumentWithID(change.getDocumentId());
+                if (doc != null) {
+                    doc.forgetCurrentRevision();
+                }
+            }
+            changesToNotify.clear();
+        }
+        postChangeNotifications();
     }
 
     /**
@@ -3538,7 +3996,7 @@ public final class Database {
                 if(validations != null && validations.size() > 0) {
                     // Fetch the previous revision and validate the new one against it:
                     RevisionInternal fakeNewRev = oldRev.copyWithDocID(oldRev.getDocId(), null);
-                    RevisionInternal prevRev = new RevisionInternal(docId, prevRevId, false, this);
+                    RevisionInternal prevRev = new RevisionInternal(docId, prevRevId, false);
                     validateRevision(fakeNewRev, prevRev,prevRevId);
                 }
 
@@ -3602,7 +4060,7 @@ public final class Database {
             //// PART II: In which we prepare for insertion...
 
             // Get the attachments:
-            Map<String, AttachmentInternal> attachments = getAttachmentsFromRevision(oldRev);
+            Map<String, AttachmentInternal> attachments = getAttachmentsFromRevision(oldRev, prevRevId);
 
             // Bump the revID and update the JSON:
             byte[] json = null;
@@ -3633,7 +4091,19 @@ public final class Database {
             // Now insert the rev itself:
             long newSequence = insertRevision(newRev, docNumericID, parentSequence, true, (attachments != null), json);
             if(newSequence <= 0) {
-                return null;
+                // The insert failed. If it was due to a constraint violation, that means a revision
+                // already exists with identical contents and the same parent rev. We can ignore this
+                // insert call, then.
+                // TODO - figure out database error code
+                // NOTE - In AndroidSQLiteStorageEngine.java, CBL Android uses insert() method of SQLiteDatabase
+                //        which return -1 for error case. Instead of insert(), should use insertOrThrow method()
+                //        which throws detailed error code. Need to check with SQLiteDatabase.CONFLICT_FAIL.
+                //        However, returning after updating parentSequence might not cause any problem.
+                //if (_fmdb.lastErrorCode != SQLITE_CONSTRAINT)
+                //    return null;
+                Log.w(Database.TAG, "Duplicate rev insertion: " + docId + " / " + newRevId);
+                newRev.setBody(null);
+                // don't return yet; update the parent's current just to be sure (see #316 (iOS #509))
             }
 
             // Make replaced rev non-current:
@@ -3646,6 +4116,12 @@ public final class Database {
                 throw new CouchbaseLiteException(e, Status.INTERNAL_SERVER_ERROR);
             }
 
+            if(newSequence <= 0) {
+                // duplicate rev; see above
+                resultStatus.setCode(Status.OK);
+                databaseStorageChanged(new DocumentChange(newRev, winningRev, inConflict, null));
+                return newRev;
+            }
 
             // Store any attachments:
             if(attachments != null) {
@@ -3675,12 +4151,17 @@ public final class Database {
         }
 
         //// EPILOGUE: A change notification is sent...
-        notifyChange(newRev, winningRev, null, inConflict);
+        databaseStorageChanged(new DocumentChange(newRev, winningRev, inConflict, null));
         return newRev;
     }
 
     /**
      * @exclude
+     * in CBLDatabase+Insertion.m
+     * - (CBL_Revision*) winnerWithDocID: (SInt64)docNumericID
+     *                         oldWinner: (NSString*)oldWinningRevID
+     *                        oldDeleted: (BOOL)oldWinnerWasDeletion
+     *                            newRev: (CBL_Revision*)newRev
      */
     @InterfaceAudience.Private
     RevisionInternal winner(long docNumericID,
@@ -3712,7 +4193,7 @@ public final class Database {
                     return newRev;
                 } else {
                     boolean deleted = false;
-                    RevisionInternal winningRev = new RevisionInternal(newRev.getDocId(), winningRevID, deleted, this);
+                    RevisionInternal winningRev = new RevisionInternal(newRev.getDocId(), winningRevID, deleted);
                     return winningRev;
                 }
             }
@@ -3751,13 +4232,24 @@ public final class Database {
         return result;
     }
 
+    Map<String, Object> getAttachments(String docID, String revID) {
+        RevisionInternal mrev = new RevisionInternal(docID, revID, false);
+        try {
+            RevisionInternal rev = loadRevisionBody(mrev, EnumSet.noneOf(TDContentOptions.class));
+            return rev.getAttachments();
+        } catch (CouchbaseLiteException e) {
+            Log.w(Log.TAG_DATABASE, "Failed to get attachments for " + mrev, e);
+            return null;
+        }
+    }
+
     /**
      * Given a revision, read its _attachments dictionary (if any), convert each attachment to a
      * AttachmentInternal object, and return a dictionary mapping names->CBL_Attachments.
      * @exclude
      */
     @InterfaceAudience.Private
-    Map<String, AttachmentInternal> getAttachmentsFromRevision(RevisionInternal rev) throws CouchbaseLiteException {
+    Map<String, AttachmentInternal> getAttachmentsFromRevision(RevisionInternal rev, String prevRevID) throws CouchbaseLiteException {
 
         Map<String, Object> revAttachments = (Map<String, Object>) rev.getPropertyForKey("_attachments");
         if (revAttachments == null || revAttachments.size() == 0 || rev.isDeleted()) {
@@ -3774,7 +4266,7 @@ public final class Database {
                 // If there's inline attachment data, decode and store it:
                 byte[] newContents;
                 try {
-                    newContents = Base64.decode(newContentBase64);
+                    newContents = Base64.decode(newContentBase64, Base64.DONT_GUNZIP);
                 } catch (IOException e) {
                     throw new CouchbaseLiteException(e, Status.BAD_ENCODING);
                 }
@@ -3791,18 +4283,40 @@ public final class Database {
                 // This means it's already been registered in _pendingAttachmentsByDigest;
                 // I just need to look it up by its "digest" property and install it into the store:
                 installAttachment(attachment, attachInfo);
-
             }
             else {
                 // This item is just a stub; validate and skip it
-                if (((Boolean)attachInfo.get("stub")).booleanValue() == false) {
+                if (((Boolean) attachInfo.get("stub")).booleanValue() == false) {
                     throw new CouchbaseLiteException("Expected this attachment to be a stub", Status.BAD_ATTACHMENT);
                 }
-                int revPos = ((Integer)attachInfo.get("revpos")).intValue();
+                int revPos = ((Integer) attachInfo.get("revpos")).intValue();
                 if (revPos <= 0) {
                     throw new CouchbaseLiteException("Invalid revpos: " + revPos, Status.BAD_ATTACHMENT);
                 }
-                continue;
+                Map<String, Object> parentAttachments = getAttachments(rev.getDocId(), prevRevID);
+                if (parentAttachments != null && parentAttachments.containsKey(name)) {
+                    Map<String, Object> parentAttachment = (Map<String, Object>) parentAttachments.get(name);
+                    try {
+                        BlobKey blobKey = new BlobKey((String) attachInfo.get("digest"));
+                        attachment.setBlobKey(blobKey);
+                    } catch (IllegalArgumentException e) {
+                        continue;
+                    }
+                } else if (parentAttachments == null || !parentAttachments.containsKey(name)) {
+                    BlobKey blobKey = null;
+                    try {
+                        blobKey = new BlobKey((String) attachInfo.get("digest"));
+                    } catch (IllegalArgumentException e) {
+                        continue;
+                    }
+                    if (getAttachments().hasBlobForKey(blobKey)) {
+                        attachment.setBlobKey(blobKey);
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
             }
 
             // Handle encoded attachment:
@@ -3836,6 +4350,10 @@ public final class Database {
      *
      * It must already have a revision ID. This may create a conflict! The revision's history must be given; ancestor revision IDs that don't already exist locally will create phantom revisions with no content.
      * @exclude
+     * in CBLDatabase+Insertion.m
+     * - (CBLStatus) forceInsert: (CBL_Revision*)inRev
+     *           revisionHistory: (NSArray*)history  // in *reverse* order, starting with rev's revID
+     *                    source: (NSURL*)source
      */
     @InterfaceAudience.Private
     public void forceInsert(RevisionInternal rev, List<String> revHistory, URL source) throws CouchbaseLiteException {
@@ -3849,7 +4367,7 @@ public final class Database {
 
         String docId = rev.getDocId();
         String revId = rev.getRevId();
-        if(!isValidDocumentId(docId) || (revId == null)) {
+        if (!isValidDocumentId(docId) || (revId == null)) {
             throw new CouchbaseLiteException(Status.BAD_REQUEST);
         }
 
@@ -3857,29 +4375,38 @@ public final class Database {
         if (revHistory != null) {
             historyCount = revHistory.size();
         }
-        if(historyCount == 0) {
+        if (historyCount == 0) {
             revHistory = new ArrayList<String>();
             revHistory.add(revId);
             historyCount = 1;
-        } else if(!revHistory.get(0).equals(rev.getRevId())) {
+        } else if (!revHistory.get(0).equals(rev.getRevId())) {
             throw new CouchbaseLiteException(Status.BAD_REQUEST);
         }
 
         boolean success = false;
         beginTransaction();
         try {
-            // First look up all locally-known revisions of this document:
+            // First look up the document's row-id and all locally-known revisions of it:
+            Map<String, RevisionInternal> localRevs = null;
+            boolean isNewDoc = (historyCount == 1);
             long docNumericID = getOrInsertDocNumericID(docId);
-            RevisionList localRevs = getAllRevisionsOfDocumentID(docId, docNumericID, false);
-            if(localRevs == null) {
-                throw new CouchbaseLiteException(Status.INTERNAL_SERVER_ERROR);
+
+            if (!isNewDoc) {
+                RevisionList localRevsList = getAllRevisionsOfDocumentID(docId, docNumericID, false);
+                if (localRevsList == null) {
+                    throw new CouchbaseLiteException(Status.INTERNAL_SERVER_ERROR);
+                }
+                localRevs = new HashMap<String, RevisionInternal>();
+                for (RevisionInternal r : localRevsList) {
+                    localRevs.put(r.getRevId(), r);
+                }
             }
 
             // Validate against the latest common ancestor:
-            if(validations != null && validations.size() > 0) {
+            if (validations != null && validations.size() > 0) {
                 RevisionInternal oldRev = null;
                 for (int i = 1; i < historyCount; i++) {
-                    oldRev = localRevs.revWithDocIdAndRevId(docId, revHistory.get(i));
+                    oldRev = (localRevs != null) ? localRevs.get(revHistory.get(i)) : null;
                     if (oldRev != null) {
                         break;
                     }
@@ -3896,7 +4423,7 @@ public final class Database {
                 oldWinnerWasDeletion = true;
             }
             if (outIsConflict.get()) {
-               inConflict = true;
+                inConflict = true;
             }
 
             // Walk through the remote history in chronological order, matching each revision ID to
@@ -3904,50 +4431,47 @@ public final class Database {
             // in the local history:
             long sequence = 0;
             long localParentSequence = 0;
-            String localParentRevID = null;
-            for(int i = revHistory.size() - 1; i >= 0; --i) {
+            for (int i = revHistory.size() - 1; i >= 0; --i) {
                 revId = revHistory.get(i);
-                RevisionInternal localRev = localRevs.revWithDocIdAndRevId(docId, revId);
-                if(localRev != null) {
+                RevisionInternal localRev = (localRevs != null) ? localRevs.get(revId) : null;
+                if (localRev != null) {
                     // This revision is known locally. Remember its sequence as the parent of the next one:
                     sequence = localRev.getSequence();
-                    assert(sequence > 0);
+                    assert (sequence > 0);
                     localParentSequence = sequence;
-                    localParentRevID = revId;
-                }
-                else {
+                } else {
                     // This revision isn't known, so add it:
 
                     RevisionInternal newRev;
                     byte[] data = null;
                     boolean current = false;
-                    if(i == 0) {
+                    if (i == 0) {
                         // Hey, this is the leaf revision we're inserting:
-                       newRev = rev;
-                       if(!rev.isDeleted()) {
-                           data = encodeDocumentJSON(rev);
-                           if(data == null) {
-                               throw new CouchbaseLiteException(Status.BAD_REQUEST);
-                           }
-                       }
-                       current = true;
-                    }
-                    else {
+                        newRev = rev;
+                        if (!rev.isDeleted()) {
+                            data = encodeDocumentJSON(rev);
+                            if (data == null) {
+                                throw new CouchbaseLiteException(Status.BAD_REQUEST);
+                            }
+                        }
+                        current = true;
+                    } else {
                         // It's an intermediate parent, so insert a stub:
-                        newRev = new RevisionInternal(docId, revId, false, this);
+                        newRev = new RevisionInternal(docId, revId, false);
                     }
 
                     // Insert it:
-                    sequence = insertRevision(newRev, docNumericID, sequence, current, (newRev.getAttachments().size() > 0), data);
+                    sequence = insertRevision(newRev, docNumericID, sequence, current, (newRev.getAttachments() != null && newRev.getAttachments().size() > 0), data);
 
-                    if(sequence <= 0) {
+                    if (sequence <= 0) {
                         throw new CouchbaseLiteException(Status.INTERNAL_SERVER_ERROR);
                     }
 
-                    if(i == 0) {
+                    if (i == 0) {
                         // Write any changed attachments for the new revision. As the parent sequence use
                         // the latest local revision (this is to copy attachments from):
-                        Map<String, AttachmentInternal> attachments = getAttachmentsFromRevision(rev);
+                        String prevRevID = (revHistory.size() >= 2) ? revHistory.get(1) : null;
+                        Map<String, AttachmentInternal> attachments = getAttachmentsFromRevision(rev, prevRevID);
                         if (attachments != null) {
                             processAttachmentsForRevision(attachments, rev, localParentSequence);
                             stubOutAttachmentsInRevision(attachments, rev);
@@ -3958,10 +4482,10 @@ public final class Database {
             }
 
             // Mark the latest local rev as no longer current:
-            if(localParentSequence > 0 && localParentSequence != sequence) {
+            if (localParentSequence > 0 && localParentSequence != sequence) {
                 ContentValues args = new ContentValues();
                 args.put("current", 0);
-                String[] whereArgs = { Long.toString(localParentSequence) };
+                String[] whereArgs = {Long.toString(localParentSequence)};
                 int numRowsChanged = 0;
                 try {
                     numRowsChanged = database.update("revs", args, "sequence=? AND current!=0", whereArgs);
@@ -3978,17 +4502,13 @@ public final class Database {
             success = true;
 
             // Notify and return:
-            notifyChange(rev, winningRev, source, inConflict);
+            databaseStorageChanged(new DocumentChange(rev, winningRev, inConflict, source));
 
-
-        } catch(SQLException e) {
+        } catch (SQLException e) {
             throw new CouchbaseLiteException(Status.INTERNAL_SERVER_ERROR);
         } finally {
             endTransaction(success);
         }
-
-
-
     }
 
     /** VALIDATION **/
@@ -4026,9 +4546,11 @@ public final class Database {
     @InterfaceAudience.Private
     public Replication getActiveReplicator(URL remote, boolean push) {
         if(activeReplicators != null) {
-            for (Replication replicator : activeReplicators) {
-                if(replicator.getRemoteUrl().equals(remote) && replicator.isPull() == !push && replicator.isRunning()) {
-                    return replicator;
+            synchronized (activeReplicators) {
+                for (Replication replicator : activeReplicators) {
+                    if(replicator.getRemoteUrl().equals(remote) && replicator.isPull() == !push && replicator.isRunning()) {
+                        return replicator;
+                    }
                 }
             }
         }
@@ -4050,10 +4572,12 @@ public final class Database {
      */
     @InterfaceAudience.Private
     public Replication getReplicator(String sessionId) {
-    	if(allReplicators != null) {
-            for (Replication replicator : allReplicators) {
-                if(replicator.getSessionID().equals(sessionId)) {
-                    return replicator;
+        if (allReplicators != null) {
+            synchronized (allReplicators) {
+                for (Replication replicator : allReplicators) {
+                    if (replicator.getSessionID().equals(sessionId)) {
+                        return replicator;
+                    }
                 }
             }
         }
@@ -4354,7 +4878,7 @@ public final class Database {
             if (cursor.moveToNext()) {
                 String revId = cursor.getString(0);
                 boolean deleted = (cursor.getInt(1) > 0);
-                result = new RevisionInternal(rev.getDocId(), revId, deleted, this);
+                result = new RevisionInternal(rev.getDocId(), revId, deleted/*, this*/);
                 result.setSequence(seq);
             }
         } finally {
@@ -4541,7 +5065,7 @@ public final class Database {
                     properties = Manager.getObjectMapper().readValue(json, Map.class);
                     properties.put("_id", docID);
                     properties.put("_rev", gotRevID);
-                    result = new RevisionInternal(docID, gotRevID, false, this);
+                    result = new RevisionInternal(docID, gotRevID, false);
                     result.setProperties(properties);
                 } catch (Exception e) {
                     Log.w(Database.TAG, "Error parsing local doc JSON", e);
@@ -4753,4 +5277,92 @@ public final class Database {
         return persistentCookieStore;
     }
 
+    /**
+     * Check if Write-Ahead Logging (WAL) available
+     * http://sqlite.org/wal.html (WAL)
+     * https://www.sqlite.org/c3ref/c_source_id.html (SQLite Version)
+     * WAL requires 3.7.0 or higher
+     */
+    protected boolean isWALAvailable() {
+        String version = getSQLiteVersion();
+        if (version.isEmpty())
+            return false;
+
+        int major = 0;
+        int minor = 0;
+        int i = 0;
+        StringTokenizer tok = new StringTokenizer(version, ".");
+        while (tok.hasMoreTokens()) {
+            String token = tok.nextToken();
+            switch (i) {
+                case 0:
+                    major = Integer.parseInt(token);
+                    break;
+                case 1:
+                    minor = Integer.parseInt(token);
+                    break;
+            }
+            i++;
+        }
+
+        if (major >= 4)
+            return true;
+        else if (major == 3 && minor >= 7)
+            return true;
+
+        return false;
+    }
+
+    /**
+     * Get SQLite version
+     */
+    protected String getSQLiteVersion() {
+        String sql = "select sqlite_version() AS sqlite_version";
+        Cursor cursor = null;
+        String version = "";
+        try {
+            cursor = database.rawQuery(sql, null);
+            if (cursor.moveToNext()) {
+                version += cursor.getString(0);
+            }
+        } catch (SQLException e) {
+            Log.e(Database.TAG, "Error getting SQLite version", e);
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+        return version;
+    }
+
+    /**
+     * https://github.com/couchbase/couchbase-lite-ios/issues/615
+     */
+    protected void optimizeSQLIndexes() {
+        Log.v(Log.TAG_DATABASE, "calls optimizeSQLIndexes()");
+        final long currentSequence = getLastSequenceNumber();
+        if (currentSequence > 0) {
+            final long lastOptimized = getLastOptimized();
+            if (lastOptimized <= currentSequence / 10) {
+                runInTransaction(new TransactionalTask() {
+                    @Override
+                    public boolean run() {
+                        Log.i(Log.TAG_DATABASE, "%s: Optimizing SQL indexes (curSeq=%d, last run at %d)", this, currentSequence, lastOptimized);
+                        database.execSQL("ANALYZE");
+                        database.execSQL("ANALYZE sqlite_master");
+                        setInfo("last_optimized", String.valueOf(currentSequence));
+                        return true;
+                    }
+                });
+            }
+        }
+    }
+
+    private long getLastOptimized() {
+        String info = infoForKey("last_optimized");
+        if (info != null) {
+            return Long.parseLong(info);
+        }
+        return 0;
+    }
 }

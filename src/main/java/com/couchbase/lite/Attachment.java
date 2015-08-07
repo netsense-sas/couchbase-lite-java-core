@@ -19,11 +19,16 @@ package com.couchbase.lite;
 
 import com.couchbase.lite.internal.AttachmentInternal;
 import com.couchbase.lite.internal.InterfaceAudience;
+import com.couchbase.lite.util.Log;
 
+import java.io.File;
+import java.io.IOException;
 import java.io.InputStream;
+import java.net.URL;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.zip.GZIPInputStream;
 
 /**
  * A Couchbase Lite Document Attachment.
@@ -39,11 +44,6 @@ public final class Attachment {
      * Whether or not this attachment is gzipped
      */
     private boolean gzipped;
-
-    /**
-     * The owning document.
-     */
-    private Document document;
 
     /**
      * The filename.
@@ -81,7 +81,6 @@ public final class Attachment {
         this.name = name;
         this.metadata = metadata;
         this.gzipped = false;
-
     }
 
     /**
@@ -126,13 +125,57 @@ public final class Attachment {
     public InputStream getContent() throws CouchbaseLiteException {
         if (body != null) {
             return body;
-        }
-        else {
+        } else {
             Database db = revision.getDatabase();
-            Attachment attachment = db.getAttachmentForSequence(revision.getSequence(), this.name);
-            body = attachment.getContent();
+            long sequence = getAttachmentSequence();
+            if (sequence == 0) {
+                throw new CouchbaseLiteException(Status.INTERNAL_SERVER_ERROR);
+            }
+            Attachment attachment = db.getAttachmentForSequence(sequence, this.name);
+            body = attachment.getBodyIfNew();
+            if (attachment.getGZipped()) {
+                // Client does not expect a gzipped stream.
+                // Only Router handles gzipped streams and uses getAttachmentForSequence directly.
+                try {
+                    body = new GZIPInputStream(body);
+                } catch (IOException e) {
+                    throw new CouchbaseLiteException(e.getMessage(), Status.STATUS_ATTACHMENT_ERROR);
+                }
+            }
+            gzipped = false;
             return body;
         }
+    }
+
+    private long getAttachmentSequence() {
+        long sequence = revision.getSequence();
+        if (sequence == 0) {
+            sequence = revision.getParentSequence();
+        }
+        return sequence;
+    }
+
+    /**
+     * This is just for compatibility with iOS implementation.
+     *
+     * @exclude
+     */
+    @InterfaceAudience.Private
+    public URL getContentURL(){
+        try {
+            long sequence = getAttachmentSequence();
+            if (sequence > 0) {
+                Database db = revision.getDatabase();
+                //Attachment attachment = db.getAttachmentForSequence(sequence, this.name);
+                String path = db.getAttachmentPathForSequence(sequence, this.name);
+                if (path != null) {
+                    return new File(path).toURI().toURL();
+                }
+            }
+        } catch(Exception e){
+            Log.d(Log.TAG_DATABASE, e.getMessage());
+        }
+        return null;
     }
 
     /**
@@ -178,7 +221,7 @@ public final class Attachment {
      * the metadata 'digest' and 'follows' properties accordingly.
      */
     @InterfaceAudience.Private
-    /* package */ static Map<String, Object> installAttachmentBodies(Map<String, Object> attachments, Database database) {
+    /* package */ static Map<String, Object> installAttachmentBodies(Map<String, Object> attachments, Database database) throws CouchbaseLiteException {
 
         Map<String, Object> updatedAttachments = new HashMap<String, Object>();
         for (String name : attachments.keySet()) {
@@ -190,7 +233,12 @@ public final class Attachment {
                 InputStream body = attachment.getBodyIfNew();
                 if (body != null) {
                     // Copy attachment body into the database's blob store:
-                    BlobStoreWriter writer = blobStoreWriterForBody(body, database);
+                    BlobStoreWriter writer;
+                    try {
+                        writer = blobStoreWriterForBody(body, database);
+                    } catch (IOException e) {
+                        throw new CouchbaseLiteException(e.getMessage(), Status.STATUS_ATTACHMENT_ERROR);
+                    }
                     metadataMutable.put("length", (long)writer.getLength());
                     metadataMutable.put("digest", writer.mD5DigestString());
                     metadataMutable.put("follows", true);
@@ -209,15 +257,22 @@ public final class Attachment {
     }
 
     @InterfaceAudience.Private
-    /* package */ static BlobStoreWriter blobStoreWriterForBody(InputStream body, Database database) {
+    /* package */ static BlobStoreWriter blobStoreWriterForBody(InputStream body, Database database) throws IOException {
         BlobStoreWriter writer = database.getAttachmentWriter();
-        writer.read(body);
-        writer.finish();
+        try {
+            writer.read(body);
+            writer.finish();
+        } catch (IOException e) {
+            writer.cancel();
+            throw e;
+        }
         return writer;
-
     }
 
     /**
+     * NOTE: getGZipped() can return correct value if Attachment is returned from Database.getAttachmentForSequence(long, String).
+     *       This method should be internal use only.
+     *
      * @exclude
      */
     @InterfaceAudience.Private
@@ -232,6 +287,4 @@ public final class Attachment {
     public void setGZipped(boolean gzipped) {
         this.gzipped = gzipped;
     }
-
-
 }

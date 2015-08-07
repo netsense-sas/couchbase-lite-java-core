@@ -10,15 +10,16 @@ import com.couchbase.lite.internal.InterfaceAudience;
 import com.couchbase.lite.internal.RevisionInternal;
 import com.couchbase.lite.support.BatchProcessor;
 import com.couchbase.lite.support.Batcher;
+import com.couchbase.lite.support.BlockingQueueListener;
+import com.couchbase.lite.support.CustomFuture;
+import com.couchbase.lite.support.CustomLinkedBlockingQueue;
 import com.couchbase.lite.support.HttpClientFactory;
-import com.couchbase.lite.support.RemoteMultipartDownloaderRequest;
-import com.couchbase.lite.support.RemoteMultipartRequest;
-import com.couchbase.lite.support.RemoteRequest;
 import com.couchbase.lite.support.RemoteRequestCompletionBlock;
 import com.couchbase.lite.support.RemoteRequestRetry;
 import com.couchbase.lite.util.CollectionUtils;
 import com.couchbase.lite.util.Log;
 import com.couchbase.lite.util.TextUtils;
+import com.couchbase.lite.util.URIUtils;
 import com.couchbase.lite.util.Utils;
 import com.couchbase.org.apache.http.entity.mime.MultipartEntity;
 import com.github.oxo42.stateless4j.StateMachine;
@@ -44,12 +45,11 @@ import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -58,7 +58,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * @exclude
  */
 @InterfaceAudience.Private
-abstract class ReplicationInternal {
+abstract class ReplicationInternal implements BlockingQueueListener{
 
     // Change listeners can be called back synchronously or asynchronously.
     protected enum ChangeListenerNotifyStyle { SYNC, ASYNC };
@@ -67,11 +67,12 @@ abstract class ReplicationInternal {
 
     public static final String CHANNELS_QUERY_PARAM = "channels";
 
-    public static final String REPLICATOR_DATABASE_NAME = "_replicator";
-
     public static final int EXECUTOR_THREAD_POOL_SIZE = 5;
 
     private static int lastSessionID = 0;
+
+    public static int MAX_RETRIES = 10;  // total number of attempts = 11 (1 initial + MAX_RETRIES)
+    public static int RETRY_DELAY_SECONDS = 60; // #define kRetryDelay 60.0 in CBL_Replicator.m
 
     protected Replication parentReplication;
     protected Database db;
@@ -88,16 +89,15 @@ abstract class ReplicationInternal {
     protected static final int PROCESSOR_DELAY = 500;
     protected static int INBOX_CAPACITY = 100;
     protected ScheduledExecutorService remoteRequestExecutor;
-    protected int asyncTaskCount;
     protected Throwable error;
     private String remoteCheckpointDocID;
     protected Map<String, Object> remoteCheckpoint;
     protected AtomicInteger completedChangesCount;
     protected AtomicInteger changesCount;
-    private int revisionsFailed;
     protected CollectionUtils.Functor<RevisionInternal,RevisionInternal> revisionBodyTransformationBlock;
     protected String sessionID;
     protected BlockingQueue<Future> pendingFutures;
+    private boolean lastSequenceChanged = false;
     private boolean savingCheckpoint;
     private boolean overdueForCheckpointSave;
 
@@ -111,6 +111,8 @@ abstract class ReplicationInternal {
     protected Replication.Lifecycle lifecycle;
     protected ChangeListenerNotifyStyle changeListenerNotifyStyle;
 
+    private Future retryFuture = null;  // future obj of retry task
+    private int retryCount = 0;         // counter for retry.
 
     /**
      * Constructor
@@ -144,10 +146,11 @@ abstract class ReplicationInternal {
         //   depending on calling replication.status(), and changeListenerNotifyStyle could be set to SYNC.
         changeListenerNotifyStyle = ChangeListenerNotifyStyle.ASYNC;
 
-        pendingFutures = new LinkedBlockingQueue<Future>();
+        pendingFutures = new CustomLinkedBlockingQueue<Future>(this);
 
         initializeStateMachine();
 
+        this.retryCount = 0;
     }
 
     /**
@@ -182,19 +185,24 @@ abstract class ReplicationInternal {
      * Fire a trigger to the state machine
      */
     protected void fireTrigger(final ReplicationTrigger trigger) {
+        Log.d(Log.TAG_SYNC, "[fireTrigger()] => " + trigger);
         // All state machine triggers need to happen on the replicator thread
-        workExecutor.submit(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    Log.d(Log.TAG_SYNC, "firing trigger: %s", trigger);
-                    stateMachine.fire(trigger);
-                } catch (Exception e) {
-                    e.printStackTrace();
-                    throw new RuntimeException(e);
-                }
+        synchronized (workExecutor) {
+            if (!workExecutor.isShutdown()) {
+                workExecutor.submit(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            Log.d(Log.TAG_SYNC, "firing trigger: %s", trigger);
+                            stateMachine.fire(trigger);
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                            throw new RuntimeException(e);
+                        }
+                    }
+                });
             }
-        });
+        }
     }
 
     /**
@@ -238,6 +246,7 @@ abstract class ReplicationInternal {
 
             initNetworkReachabilityManager();
 
+            this.retryCount = 0;
         } catch (Exception e) {
             Log.e(Log.TAG_SYNC, "%s: Exception in start()", e, this);
         }
@@ -264,8 +273,18 @@ abstract class ReplicationInternal {
     }
 
     public void databaseClosing() {
-        saveLastSequence();
         triggerStop();
+    }
+
+    /**
+     * Close all resources associated with this replicator.
+     */
+    protected void close() {
+        // shutdown ScheduledExecutorService. Without shutdown, cause thread leak
+        if (remoteRequestExecutor != null && !remoteRequestExecutor.isShutdown()) {
+            // Note: Time to wait is set 60 sec because RemoteRequest's socket timeout is set 60 seconds.
+            Utils.shutdownAndAwaitTermination(remoteRequestExecutor, Replication.DEFAULT_MAX_TIMEOUT_FOR_SHUTDOWN);
+        }
     }
 
     protected void initAuthorizer() {
@@ -283,8 +302,6 @@ abstract class ReplicationInternal {
                     Log.v(Log.TAG_SYNC, "*** %s: BEGIN processInbox (%d sequences)", this, inbox.size());
                     processInbox(new RevisionList(inbox));
                     Log.v(Log.TAG_SYNC, "*** %s: END processInbox (lastSequence=%s)", this, lastSequence);
-                    Log.v(Log.TAG_SYNC, "%s: batcher calling updateActive()", this);
-                    updateActive();
                 } catch (Exception e) {
                     Log.e(Log.TAG_SYNC,"ERROR: processInbox failed: ",e);
                     throw new RuntimeException(e);
@@ -305,7 +322,10 @@ abstract class ReplicationInternal {
 
     protected void goOnlineInitialStartup() {
 
-        remoteRequestExecutor = Executors.newScheduledThreadPool(EXECUTOR_THREAD_POOL_SIZE, new ThreadFactory() {
+        int executorThreadPoolSize = db.getManager().getExecutorThreadPoolSize() <= 0 ?
+                EXECUTOR_THREAD_POOL_SIZE: db.getManager().getExecutorThreadPoolSize();
+        Log.v(Log.TAG_SYNC, "executorThreadPoolSize=" +  executorThreadPoolSize);
+        remoteRequestExecutor = Executors.newScheduledThreadPool(executorThreadPoolSize, new ThreadFactory() {
             private int counter = 0;
             @Override
             public Thread newThread(Runnable r) {
@@ -436,6 +456,10 @@ abstract class ReplicationInternal {
             notifyChangeListeners(changeEvent);
         }
 
+        // #352
+        // iOS version: stop replicator immediately when call setError() with permanent error.
+        // But, for Core Java, some of codes wait IDLE state. So this is reason to wait till
+        // state becomes IDLE.
     }
 
 
@@ -500,7 +524,7 @@ abstract class ReplicationInternal {
      */
     @InterfaceAudience.Private
     public Future sendAsyncRequest(String method, URL url, Object body, boolean dontLog404, final RemoteRequestCompletionBlock onCompletion) {
-
+        Log.d(Log.TAG_SYNC, "[sendAsyncRequest()] " + method + " => " + url);
         RemoteRequestRetry request = new RemoteRequestRetry(
                 RemoteRequestRetry.RemoteRequestType.REMOTE_REQUEST,
                 remoteRequestExecutor,
@@ -531,9 +555,9 @@ abstract class ReplicationInternal {
             }
         });
 
-        Future future = request.submit();
-        return future;
 
+        Future future = request.submit(canSendCompressedRequests());
+        return future;
     }
 
     /**
@@ -573,7 +597,7 @@ abstract class ReplicationInternal {
      * @exclude
      */
     @InterfaceAudience.Private
-    public Future sendAsyncMultipartDownloaderRequest(String method, String relativePath, Object body, Database db, RemoteRequestCompletionBlock onCompletion) {
+    public CustomFuture sendAsyncMultipartDownloaderRequest(String method, String relativePath, Object body, Database db, RemoteRequestCompletionBlock onCompletion) {
         try {
 
             String urlStr = buildRelativeURLString(relativePath);
@@ -594,10 +618,8 @@ abstract class ReplicationInternal {
 
             request.setAuthenticator(getAuthenticator());
 
-            Future future = request.submit();
+            CustomFuture future = request.submit();
             return future;
-
-
         } catch (MalformedURLException e) {
             Log.e(Log.TAG_SYNC, "Malformed URL for async request", e);
         }
@@ -637,10 +659,16 @@ abstract class ReplicationInternal {
     }
 
     /**
+     * in CBL_Replicator.m
+     * - (void) saveLastSequence
+     *
      * @exclude
      */
     @InterfaceAudience.Private
     public void saveLastSequence() {
+        if(!lastSequenceChanged) {
+            return;
+        }
 
         if (savingCheckpoint) {
             // If a save is already in progress, don't do anything. (The completion block will trigger
@@ -649,7 +677,8 @@ abstract class ReplicationInternal {
             return;
         }
 
-        savingCheckpoint = true;
+        lastSequenceChanged = false;
+        overdueForCheckpointSave = false;
 
         Log.d(Log.TAG_SYNC, "%s: saveLastSequence() called. lastSequence: %s remoteCheckpoint: %s", this, lastSequence, remoteCheckpoint);
         final Map<String, Object> body = new HashMap<String, Object>();
@@ -658,6 +687,7 @@ abstract class ReplicationInternal {
         }
         body.put("lastSequence", lastSequence);
 
+        savingCheckpoint = true;
         final String remoteCheckpointDocID = remoteCheckpointDocID();
         if (remoteCheckpointDocID == null) {
             Log.w(Log.TAG_SYNC, "%s: remoteCheckpointDocID is null, aborting saveLastSequence()", this);
@@ -682,6 +712,7 @@ abstract class ReplicationInternal {
                             case Status.NOT_FOUND:
                                 Log.i(Log.TAG_SYNC, "%s: could not save remote checkpoint: 404 NOT FOUND", this);
                                 remoteCheckpoint = null;  // doc deleted or db reset
+                                overdueForCheckpointSave = true; // try saving again
                                 break;
                             case Status.CONFLICT:
                                 Log.i(Log.TAG_SYNC, "%s: could not save remote checkpoint: 409 CONFLICT", this);
@@ -729,9 +760,8 @@ abstract class ReplicationInternal {
      */
     @InterfaceAudience.Private
     private void refreshRemoteCheckpointDoc() {
-        Log.d(Log.TAG_SYNC, "%s: Refreshing remote checkpoint to get its _rev...", this);
+        Log.i(Log.TAG_SYNC, "%s: Refreshing remote checkpoint to get its _rev...", this);
         Future future = sendAsyncRequest("GET", "/_local/" + remoteCheckpointDocID(), null, new RemoteRequestCompletionBlock() {
-
             @Override
             public void onCompletion(HttpResponse httpResponse, Object result, Throwable e) {
                 if (db == null) {
@@ -743,6 +773,7 @@ abstract class ReplicationInternal {
                 } else {
                     Log.d(Log.TAG_SYNC, "%s: Refreshed remote checkpoint: %s", this, result);
                     remoteCheckpoint = (Map<String, Object>) result;
+                    lastSequenceChanged = true;
                     saveLastSequence();  // try saving again
                 }
             }
@@ -785,10 +816,10 @@ abstract class ReplicationInternal {
      */
     @InterfaceAudience.Private
     public void fetchRemoteCheckpointDoc() {
+        lastSequenceChanged = false;
         String checkpointId = remoteCheckpointDocID();
         final String localLastSequence = db.lastSequenceWithCheckpointId(checkpointId);
         boolean dontLog404 = true;
-
         Future future = sendAsyncRequest("GET", "/_local/" + checkpointId, null, dontLog404, new RemoteRequestCompletionBlock() {
 
             @Override
@@ -955,6 +986,18 @@ abstract class ReplicationInternal {
     abstract protected void processInbox(RevisionList inbox);
 
     /**
+     * gzip
+     *
+     * in CBL_Replicator.m
+     * - (BOOL) canSendCompressedRequests
+     */
+    public boolean canSendCompressedRequests(){
+        // https://github.com/couchbase/couchbase-lite-ios/issues/240#issuecomment-32506552
+        // gzip upload is only enabled when the server is Sync Gateway 0.92 or later
+        return serverIsSyncGatewayVersion("0.92");
+    }
+
+    /**
      * After successfully authenticating and getting remote checkpoint,
      * begin the work of transferring documents.
      */
@@ -965,6 +1008,7 @@ abstract class ReplicationInternal {
      */
     protected void stopGraceful() {
         Log.d(Log.TAG_SYNC, "stopGraceful()");
+        this.retryCount = 0;
     }
 
     /**
@@ -980,20 +1024,25 @@ abstract class ReplicationInternal {
                     Log.e(Log.TAG_SYNC, "Exception notifying replication listener: %s", e);
                 }
             }
-        } else { // ASYNC
-            workExecutor.submit(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        for (ChangeListener changeListener : changeListeners) {
-                            changeListener.changed(changeEvent);
+        } else {
+            // ASYNC
+            synchronized (workExecutor) {
+                if (!workExecutor.isShutdown()) {
+                    workExecutor.submit(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                for (ChangeListener changeListener : changeListeners) {
+                                    changeListener.changed(changeEvent);
+                                }
+                            } catch (Exception e) {
+                                Log.e(Log.TAG_SYNC, "Exception notifying replication listener: %s", e);
+                                throw new RuntimeException(e);
+                            }
                         }
-                    } catch (Exception e) {
-                        Log.e(Log.TAG_SYNC, "Exception notifying replication listener: %s", e);
-                        throw new RuntimeException(e);
-                    }
+                    });
                 }
-            });
+            }
         }
     }
 
@@ -1021,6 +1070,10 @@ abstract class ReplicationInternal {
         // permitted transitions
         stateMachine.configure(ReplicationState.INITIAL).permit(
                 ReplicationTrigger.START,
+                ReplicationState.RUNNING
+        );
+        stateMachine.configure(ReplicationState.IDLE).permit(
+                ReplicationTrigger.RESUME,
                 ReplicationState.RUNNING
         );
         stateMachine.configure(ReplicationState.RUNNING).permit(
@@ -1055,6 +1108,7 @@ abstract class ReplicationInternal {
         stateMachine.configure(ReplicationState.STOPPED).ignore(ReplicationTrigger.STOP_IMMEDIATE);
         stateMachine.configure(ReplicationState.STOPPING).ignore(ReplicationTrigger.WAITING_FOR_CHANGES);
         stateMachine.configure(ReplicationState.STOPPED).ignore(ReplicationTrigger.WAITING_FOR_CHANGES);
+        stateMachine.configure(ReplicationState.OFFLINE).ignore(ReplicationTrigger.WAITING_FOR_CHANGES);
         stateMachine.configure(ReplicationState.INITIAL).ignore(ReplicationTrigger.GO_OFFLINE);
         stateMachine.configure(ReplicationState.STOPPING).ignore(ReplicationTrigger.GO_OFFLINE);
         stateMachine.configure(ReplicationState.STOPPED).ignore(ReplicationTrigger.GO_OFFLINE);
@@ -1064,41 +1118,64 @@ abstract class ReplicationInternal {
         stateMachine.configure(ReplicationState.STOPPING).ignore(ReplicationTrigger.GO_ONLINE);
         stateMachine.configure(ReplicationState.STOPPED).ignore(ReplicationTrigger.GO_ONLINE);
         stateMachine.configure(ReplicationState.IDLE).ignore(ReplicationTrigger.GO_ONLINE);
+        stateMachine.configure(ReplicationState.OFFLINE).ignore(ReplicationTrigger.RESUME);
+        stateMachine.configure(ReplicationState.INITIAL).ignore(ReplicationTrigger.RESUME);
+        stateMachine.configure(ReplicationState.RUNNING).ignore(ReplicationTrigger.RESUME);
+        stateMachine.configure(ReplicationState.STOPPING).ignore(ReplicationTrigger.RESUME);
+        stateMachine.configure(ReplicationState.STOPPED).ignore(ReplicationTrigger.RESUME);
 
         // actions
         stateMachine.configure(ReplicationState.RUNNING).onEntry(new Action1<Transition<ReplicationState, ReplicationTrigger>>() {
             @Override
             public void doIt(Transition<ReplicationState, ReplicationTrigger> transition) {
-                Log.d(Log.TAG_SYNC, "entered the RUNNING state, calling start()");
+                Log.v(Log.TAG_SYNC, "[onEntry()] " + transition.getSource() + " => " + transition.getDestination());
                 ReplicationInternal.this.start();
-                Log.d(Log.TAG_SYNC, "called start(), calling notifyChangeListenersStateTransition");
-
                 notifyChangeListenersStateTransition(transition);
-                Log.d(Log.TAG_SYNC, "called notifyChangeListenersStateTransition");
-
             }
         });
+
         stateMachine.configure(ReplicationState.RUNNING).onExit(new Action1<Transition<ReplicationState, ReplicationTrigger>>() {
             @Override
             public void doIt(Transition<ReplicationState, ReplicationTrigger> transition) {
-                Log.d(Log.TAG_SYNC, "replicator exiting the RUNNING method");
+                Log.v(Log.TAG_SYNC, "[onExit()] " + transition.getSource() + " => " + transition.getDestination());
             }
         });
         stateMachine.configure(ReplicationState.IDLE).onEntry(new Action1<Transition<ReplicationState, ReplicationTrigger>>() {
             @Override
             public void doIt(Transition<ReplicationState, ReplicationTrigger> transition) {
+                Log.v(Log.TAG_SYNC, "[onEntry()] " + transition.getSource() + " => " + transition.getDestination());
+                retryReplicationIfError();
+                if(transition.getSource() == transition.getDestination()) {
+                    // ignore IDLE to IDLE
+                    return;
+                }
                 notifyChangeListenersStateTransition(transition);
+
+                // #352
+                // iOS version: stop replicator immediately when call setError() with permanent error.
+                // But, for Core Java, some of codes wait IDLE state. So this is reason to wait till
+                // state becomes IDLE.
+                if(Utils.isPermanentError(error) && isContinuous()){
+                    Log.d(Log.TAG_SYNC, "IDLE: triggerStop() " + error.toString());
+                    triggerStop();
+                }
             }
         });
         stateMachine.configure(ReplicationState.IDLE).onExit(new Action1<Transition<ReplicationState, ReplicationTrigger>>() {
             @Override
             public void doIt(Transition<ReplicationState, ReplicationTrigger> transition) {
+                Log.v(Log.TAG_SYNC, "[onExit()] " + transition.getSource() + " => " + transition.getDestination());
+                if(transition.getSource() == transition.getDestination()) {
+                    // ignore IDLE to IDLE
+                    return;
+                }
                 notifyChangeListenersStateTransition(transition);
             }
         });
         stateMachine.configure(ReplicationState.OFFLINE).onEntry(new Action1<Transition<ReplicationState, ReplicationTrigger>>() {
             @Override
             public void doIt(Transition<ReplicationState, ReplicationTrigger> transition) {
+                Log.v(Log.TAG_SYNC, "[onEntry()] " + transition.getSource() + " => " + transition.getDestination());
                 goOffline();
                 notifyChangeListenersStateTransition(transition);
             }
@@ -1106,6 +1183,7 @@ abstract class ReplicationInternal {
         stateMachine.configure(ReplicationState.OFFLINE).onExit(new Action1<Transition<ReplicationState, ReplicationTrigger>>() {
             @Override
             public void doIt(Transition<ReplicationState, ReplicationTrigger> transition) {
+                Log.v(Log.TAG_SYNC, "[onExit()] " + transition.getSource() + " => " + transition.getDestination());
                 goOnline();
                 notifyChangeListenersStateTransition(transition);
             }
@@ -1113,14 +1191,39 @@ abstract class ReplicationInternal {
         stateMachine.configure(ReplicationState.STOPPING).onEntry(new Action1<Transition<ReplicationState, ReplicationTrigger>>() {
             @Override
             public void doIt(Transition<ReplicationState, ReplicationTrigger> transition) {
+                Log.v(Log.TAG_SYNC, "[onEntry()] " + transition.getSource() + " => " + transition.getDestination());
+
+                // NOTE: Based on StateMachine configuration, this should not happen.
+                //       However, from Unit Test result, this could be happen.
+                //       We should revisit StateMachine configuration and also its Thread-safe-ability
+                if(transition.getSource() == transition.getDestination()) {
+                    // ignore STOPPING to STOPPING
+                    return;
+                }
+
                 ReplicationInternal.this.stopGraceful();
                 notifyChangeListenersStateTransition(transition);
             }
         });
+
         stateMachine.configure(ReplicationState.STOPPED).onEntry(new Action1<Transition<ReplicationState, ReplicationTrigger>>() {
             @Override
             public void doIt(Transition<ReplicationState, ReplicationTrigger> transition) {
+                Log.v(Log.TAG_SYNC, "[onEntry()] " + transition.getSource() + " => " + transition.getDestination());
+                saveLastSequence(); // move from databaseClosing() method as databaseClosing() is not called if Rem
                 ReplicationInternal.this.clearDbRef();
+
+                // close any active resources associated with this replicator
+                close();
+
+                // NOTE: Based on StateMachine configuration, this should not happen.
+                //       However, from Unit Test result, this could be happen.
+                //       We should revisit StateMachine configuration and also its Thread-safe-ability
+                if (transition.getSource() == transition.getDestination()) {
+                    // ignore STOPPED to STOPPED
+                    return;
+                }
+
                 notifyChangeListenersStateTransition(transition);
             }
         });
@@ -1165,7 +1268,6 @@ abstract class ReplicationInternal {
                 String versionString = serverType.substring(prefix.length());
                 return versionString.compareTo(minVersion) >= 0;
             }
-
         }
         return false;
     }
@@ -1177,12 +1279,88 @@ abstract class ReplicationInternal {
     public void addToInbox(RevisionInternal rev) {
         Log.v(Log.TAG_SYNC, "%s: addToInbox() called, rev: %s.  Thread: %s", this, rev, Thread.currentThread());
         batcher.queueObject(rev);
-        Log.v(Log.TAG_SYNC, "%s: addToInbox() calling updateActive()", this);
-        updateActive();
     }
 
-    protected void updateActive() {
-        Log.v(Log.TAG_SYNC, "%s: updateActive() called", this);
+    /**
+     * Called after a continuous replication has gone idle, but it failed to transfer some revisions
+     * and so wants to try again in a minute. Can be overridden by subclasses.
+     *
+     * in CBL_Replicator.m
+     * - (void) retry
+     */
+    protected void retry(){
+        Log.v(Log.TAG_SYNC, "[retry()]");
+        retryCount++;
+        error = null;
+        checkSession();
+    }
+
+    /**
+     * in CBL_Replicator.m
+     * - (void) retryIfReady
+     */
+    protected void retryIfReady(){
+        Log.v(Log.TAG_SYNC, "[retryIfReady()] stateMachine => "+stateMachine.getState().toString());
+        // check if state is still IDLE (ONLINE), then retry now.
+        if(stateMachine.getState().equals(ReplicationState.IDLE)){
+            Log.v(Log.TAG_SYNC, "%s RETRYING, to transfer missed revisions...", this);
+            cancelRetryFuture();
+            retry();
+        }
+    }
+
+    /**
+     * helper function to schedule retry future. no in iOS code.
+     */
+    private void scheduleRetryFuture(){
+        long delay = RETRY_DELAY_SECONDS * (long)Math.pow((double)2, (double)Math.min(retryCount, MAX_RETRIES));
+        Log.v(Log.TAG_SYNC, "%s: Failed to xfer; will retry in %d sec",
+                this, delay);
+        this.retryFuture = workExecutor.schedule(new Runnable() {
+            public void run() {
+                retryIfReady();
+            }
+        }, delay, TimeUnit.SECONDS);
+    }
+    /**
+     * helper function to cancel retry future. not in iOS code.
+     */
+    private void cancelRetryFuture(){
+        if(retryFuture != null && !retryFuture.isDone()){
+            retryFuture.cancel(true);
+        }
+        retryFuture = null;
+    }
+
+    /**
+     * Retry replication if previous attempt ends with error
+     */
+    protected void retryReplicationIfError(){
+        // Make sure if state is IDLE, this method should be called when state becomes IDLE
+        if(!stateMachine.getState().equals(ReplicationState.IDLE)){
+            return;
+        }
+
+        // IDLE_OK
+        if(error == null){
+            retryCount = 0;
+        }
+        // IDLE_ERROR
+        else{
+            // not retry infinite times
+            if(retryCount < MAX_RETRIES) {
+                // mode should be continuous
+                if(isContinuous()){
+                    // 12/16/2014 - only retry if error is transient error 50x http error
+                    // It may need to retry for any kind of errors
+                    if(Utils.isTransientError(error)){
+
+                        cancelRetryFuture();
+                        scheduleRetryFuture();
+                    }
+                }
+            }
+        }
     }
 
     @InterfaceAudience.Private
@@ -1198,13 +1376,12 @@ abstract class ReplicationInternal {
         this.lifecycle = lifecycle;
     }
 
-    @InterfaceAudience.Private
-    protected void revisionFailed() {
-        // Remember that some revisions failed to transfer, so we can later retry.
-        ++revisionsFailed;
-    }
+    private static int SAVE_LAST_SEQUENCE_DELAY = 5; // 5 sec;
 
     /**
+     * in CBL_Replicator.m
+     * - (void) setLastSequence:(NSString*)lastSequence;
+     *
      * @exclude
      */
     @InterfaceAudience.Private
@@ -1212,7 +1389,14 @@ abstract class ReplicationInternal {
         if (lastSequenceIn != null && !lastSequenceIn.equals(lastSequence)) {
             Log.v(Log.TAG_SYNC, "%s: Setting lastSequence to %s from(%s)", this, lastSequenceIn, lastSequence );
             lastSequence = lastSequenceIn;
-            saveLastSequence();
+            if(!lastSequenceChanged) {
+                lastSequenceChanged = true;
+                workExecutor.schedule(new Runnable() {
+                    public void run() {
+                        saveLastSequence();
+                    }
+                }, SAVE_LAST_SEQUENCE_DELAY, TimeUnit.SECONDS);
+            }
         }
     }
 
@@ -1229,7 +1413,7 @@ abstract class ReplicationInternal {
                     assert(xformed.getProperties().get("_revisions").equals(rev.getProperties().get("_revisions")));
                     if (xformed.getProperties().get("_attachments") != null) {
                         // Insert 'revpos' properties into any attachments added by the callback:
-                        RevisionInternal mx = new RevisionInternal(xformed.getProperties(), db);
+                        RevisionInternal mx = new RevisionInternal(xformed.getProperties());
                         xformed = mx;
                         mx.mutateAttachments(new CollectionUtils.Functor<Map<String,Object>,Map<String,Object>>() {
                             public Map<String, Object> invoke(Map<String, Object> info) {
@@ -1267,10 +1451,12 @@ abstract class ReplicationInternal {
             }
 
             // 'status' property is nonstandard; Couchbase Lite returns it, others don't.
-            String statusString = (String) item.get("status");
-            int status = Integer.parseInt(statusString);
-            if (status >= 400) {
-                return new Status(status);
+            Object objStatus = item.get("status");
+            if (objStatus instanceof  Integer) {
+                int status = ((Integer) objStatus).intValue();
+                if (status >= 400) {
+                    return new Status(status);
+                }
             }
             // If no 'status' present, interpret magic hardcoded CouchDB error strings:
             if (errorStr.equalsIgnoreCase("unauthorized")) {
@@ -1395,9 +1581,52 @@ abstract class ReplicationInternal {
         }
     }
 
-
     public String getSessionID() {
         return sessionID;
+    }
+
+    public abstract void waitForPendingFutures();
+
+    //@Override
+    //public void changed(EventType type, Object o, BlockingQueue queue) {
+        // should be overide
+    //}
+    @Override
+    public void changed(EventType type, Object o, BlockingQueue queue) {
+        // Log.d(Log.TAG_SYNC, "[changed()] " + type + " size="+queue.size());
+
+        if(type == EventType.PUT || type == EventType.ADD) {
+            // in case of one shot, not necessary to switch state and call waitForPendingFutures.
+            if(isContinuous()) {
+                if (!queue.isEmpty()) {
+                    // trigger to RUNNING if state is IDLE
+                    fireTrigger(ReplicationTrigger.RESUME);
+
+                    // run waitForPendingFutures.
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            waitForPendingFutures();
+                        }
+                    }).start();
+                }
+            }
+        }
+    }
+
+    /**
+     * Encodes the given document id for use in an URI.
+     * <p>
+     * Avoids encoding the slash in _design documents since it may cause a 301 redirect.
+     */
+    /* package */ String encodeDocumentId(String docId) {
+        if (docId.startsWith("_design/")) {
+            // http://docs.couchdb.org/en/1.6.1/http-api.html#cap-/{db}/_design/{ddoc}
+            String designDocId = docId.substring("_design/".length());
+            return "_design/".concat(URIUtils.encode(designDocId));
+        } else {
+            return URIUtils.encode(docId);
+        }
     }
 }
 

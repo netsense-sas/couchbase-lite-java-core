@@ -156,6 +156,12 @@ public class Query {
     */
     private int prefixMatchLevel;
 
+    /**
+     * An optional predicate that filters the resulting query rows.
+     * If present, it's called on every row returned from the index, and if it returns false the
+     * row is skipped.
+     */
+    private Predicate<QueryRow> postFilter;
 
 
     private long lastSequence;
@@ -206,6 +212,7 @@ public class Query {
         indexUpdateMode = query.indexUpdateMode;
         allDocsMode = query.allDocsMode;
         inclusiveEnd = query.inclusiveEnd;
+        postFilter = query.postFilter;
     }
 
     /**
@@ -348,6 +355,16 @@ public class Query {
     }
 
     @InterfaceAudience.Public
+    public Predicate<QueryRow> getPostFilter() {
+        return postFilter;
+    }
+
+    @InterfaceAudience.Public
+    public void setPostFilter(Predicate<QueryRow> postFilter) {
+        this.postFilter = postFilter;
+    }
+
+    @InterfaceAudience.Public
     public boolean shouldPrefetch() {
         return prefetch;
     }
@@ -385,9 +402,6 @@ public class Query {
      */
     @InterfaceAudience.Public
     public LiveQuery toLiveQuery() {
-        if (view == null) {
-            throw new IllegalStateException("Cannot convert a Query to LiveQuery if the view is null");
-        }
         return new LiveQuery(this);
     }
 
@@ -425,7 +439,7 @@ public class Query {
                         throw new IllegalStateException("The database has been closed.");
                     }
 
-                    String viewName = view.getName();
+                    String viewName = (view != null) ? view.getName() : null;
                     QueryOptions options = getQueryOptions();
                     List<Long> outSequence = new ArrayList<Long>();
                     List<QueryRow> rows = database.queryViewNamed(viewName, options, outSequence);
@@ -471,6 +485,7 @@ public class Query {
         queryOptions.setAllDocsMode(getAllDocsMode());
         queryOptions.setStartKeyDocId(getStartKeyDocId());
         queryOptions.setEndKeyDocId(getEndKeyDocId());
+        queryOptions.setPostFilter(getPostFilter());
         return queryOptions;
     }
 

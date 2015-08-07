@@ -12,12 +12,14 @@ import org.apache.http.client.methods.HttpUriRequest;
 import java.io.IOException;
 import java.net.URL;
 import java.util.Map;
+import java.util.Queue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -30,10 +32,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * in between the retries.
  *
  */
-public class RemoteRequestRetry<T> implements Future<T> {
+public class RemoteRequestRetry<T> implements CustomFuture<T> {
 
     public static int MAX_RETRIES = 3;  // total number of attempts = 4 (1 initial + MAX_RETRIES)
-    public static int RETRY_DELAY_MS = 10 * 1000;
+    public static int RETRY_DELAY_MS = 4 * 1000; // 4 sec
 
     protected ScheduledExecutorService workExecutor;
     protected ExecutorService requestExecutor;  // must have more than one thread
@@ -62,6 +64,18 @@ public class RemoteRequestRetry<T> implements Future<T> {
     protected Map<String, Object> requestHeaders;
 
     private RemoteRequestType requestType;
+
+
+    // for Retry task
+    ScheduledFuture retryFuture = null;
+
+    private Queue queue = null;
+
+    @Override
+    public void setQueue(Queue queue) {
+        this.queue = queue;
+    }
+
 
     /**
      * The kind of RemoteRequest that will be created on each retry attempt
@@ -101,15 +115,29 @@ public class RemoteRequestRetry<T> implements Future<T> {
 
     }
 
-    public Future submit() {
+    public CustomFuture submit() {
+        return submit(false);
+    }
+
+    /**
+     * @param gzip true - send gzipped request
+     */
+    public CustomFuture submit(boolean gzip) {
 
         RemoteRequest request = generateRemoteRequest();
 
-        Future future = requestExecutor.submit(request);
-        pendingRequests.add(future);
+        if (gzip) {
+            request.setCompressedRequest(true);
+        }
+
+        synchronized (requestExecutor) {
+            if (!requestExecutor.isShutdown()) {
+                Future future = requestExecutor.submit(request);
+                pendingRequests.add(future);
+            }
+        }
 
         return this;
-
     }
 
     private RemoteRequest generateRemoteRequest() {
@@ -167,6 +195,12 @@ public class RemoteRequestRetry<T> implements Future<T> {
         return request;
     }
 
+    void removeFromQueue() {
+        if (queue != null) {
+            queue.remove(this);
+            setQueue(null);
+        }
+    }
 
     RemoteRequestCompletionBlock onCompletionInner = new RemoteRequestCompletionBlock() {
 
@@ -175,7 +209,15 @@ public class RemoteRequestRetry<T> implements Future<T> {
             requestResult = result;
             requestThrowable = e;
             completedSuccessfully.set(true);
+
             onCompletionCaller.onCompletion(requestHttpResponse, requestResult, requestThrowable);
+            
+            // release unnecessary references to reduce memory usage as soon as called onComplete().
+            requestHttpResponse = null;
+            requestResult = null;
+            requestThrowable = null;
+
+            removeFromQueue();
         }
 
         @Override
@@ -190,8 +232,14 @@ public class RemoteRequestRetry<T> implements Future<T> {
 
             } else {
 
+                // Only retry if error is  TransientError (5xx).
                 if (isTransientError(httpResponse, e)) {
-                    if (retryCount >= MAX_RETRIES) {
+                    if (requestExecutor != null && requestExecutor.isShutdown()) {
+                        // requestExecutor was shutdown, no more retry.
+                        Log.e(Log.TAG_SYNC, "%s: RemoteRequestRetry failed, RequestExecutor was shutdown. url: %s", this, url);
+                        completed(httpResponse, result, e);
+                    }
+                    else if (retryCount >= MAX_RETRIES) {
                         Log.d(Log.TAG_SYNC, "%s: RemoteRequestRetry failed, but transient error.  retries exhausted. url: %s", this, url);
                         // ok, we're out of retries, propagate completion block call
                         completed(httpResponse, result, e);
@@ -202,19 +250,22 @@ public class RemoteRequestRetry<T> implements Future<T> {
                         requestHttpResponse = httpResponse;
                         requestResult = result;
                         requestThrowable = e;
-
                         retryCount += 1;
-
-                        submit();
-
+                        // delay * 2 << retry
+                        long delay = RETRY_DELAY_MS * (long)Math.pow((double)2, (double)Math.min(retryCount-1, MAX_RETRIES));
+                        retryFuture = workExecutor.schedule(new Runnable() {
+                            @Override
+                            public void run() {
+                                submit();
+                            }
+                        }, delay, TimeUnit.MILLISECONDS); // delay init_delay * 2^retry ms
                     }
+
                 } else {
                     Log.d(Log.TAG_SYNC, "%s: RemoteRequestRetry failed, non-transient error.  NOT retrying. url: %s", this, url);
                     // this isn't a transient error, so there's no point in retrying
                     completed(httpResponse, result, e);
                 }
-
-
             }
         }
     };
@@ -256,6 +307,11 @@ public class RemoteRequestRetry<T> implements Future<T> {
 
     @Override
     public boolean cancel(boolean mayInterruptIfRunning) {
+        // If RemoteRequestRetry is canceled, make sure if retry future is also canceled.
+        if(retryFuture != null && !retryFuture.isCancelled()){
+            retryFuture.cancel(mayInterruptIfRunning);
+        }
+
         return false;
     }
 
@@ -274,16 +330,18 @@ public class RemoteRequestRetry<T> implements Future<T> {
 
         while (retryCount <= MAX_RETRIES) {
 
+            // requestExecutor was shutdown, no more retry.
+            if (requestExecutor == null || requestExecutor.isShutdown()) {
+                return null;
+            }
+
             // Take a future from the queue
             Future future = pendingRequests.take();
-
             future.get();
-
             if (completedSuccessfully.get() == true) {
                 // we're done
                 return null;
             }
-
         }
 
         // exhausted attempts, callback to original caller with result.  requestThrowable

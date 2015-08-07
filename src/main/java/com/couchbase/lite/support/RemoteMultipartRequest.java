@@ -14,7 +14,7 @@ import java.util.concurrent.ScheduledExecutorService;
 
 public class RemoteMultipartRequest extends RemoteRequest {
 
-    private MultipartEntity multiPart;
+    private MultipartEntity multiPart = null;
 
     public RemoteMultipartRequest(ScheduledExecutorService workExecutor,
                                   HttpClientFactory clientFactory, String method, URL url,
@@ -25,7 +25,6 @@ public class RemoteMultipartRequest extends RemoteRequest {
 
     @Override
     public void run() {
-
         HttpClient httpClient = clientFactory.getHttpClient();
 
         preemptivelySetAuthCredentials(httpClient);
@@ -35,7 +34,6 @@ public class RemoteMultipartRequest extends RemoteRequest {
             HttpPut putRequest = new HttpPut(url.toExternalForm());
             putRequest.setEntity(multiPart);
             request = putRequest;
-
         } else if (method.equalsIgnoreCase("POST")) {
             HttpPost postRequest = new HttpPost(url.toExternalForm());
             postRequest.setEntity(multiPart);
@@ -44,11 +42,9 @@ public class RemoteMultipartRequest extends RemoteRequest {
             throw new IllegalArgumentException("Invalid request method: " + method);
         }
 
+        addRequestHeaders(request);
         request.addHeader("Accept", "*/*");
 
         executeRequest(httpClient, request);
-
     }
-
-
 }

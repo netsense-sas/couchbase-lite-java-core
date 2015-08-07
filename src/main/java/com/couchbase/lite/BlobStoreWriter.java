@@ -19,27 +19,26 @@ import java.security.NoSuchAlgorithmException;
 public class BlobStoreWriter {
 
     /** The underlying blob store where it should be stored. */
-    private BlobStore store;
+    private BlobStore store =  null;
 
     /** The number of bytes in the blob. */
-    private int length;
+    private int length = 0;
 
     /** After finishing, this is the key for looking up the blob through the CBL_BlobStore. */
-    private BlobKey blobKey;
+    private BlobKey blobKey =  null;
 
     /** After finishing, store md5 digest result here */
-    private byte[] md5DigestResult;
+    private byte[] md5DigestResult =  null;
 
     /** Message digest for sha1 that is updated as data is appended */
-    private MessageDigest sha1Digest;
-    private MessageDigest md5Digest;
+    private MessageDigest sha1Digest =  null;
+    private MessageDigest md5Digest =  null;
 
-    private BufferedOutputStream outStream;
-    private File tempFile;
+    private BufferedOutputStream outStream = null;
+    private File tempFile = null;
 
     public BlobStoreWriter(BlobStore store) {
         this.store = store;
-
         try {
             sha1Digest = MessageDigest.getInstance("SHA-1");
             sha1Digest.reset();
@@ -48,38 +47,34 @@ public class BlobStoreWriter {
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException(e);
         }
-
         try {
             openTempFile();
-        } catch (FileNotFoundException e) {
+        } catch (IOException e) {
             throw new IllegalStateException(e);
         }
-
     }
 
-    private void openTempFile() throws FileNotFoundException {
-
-        String uuid = Misc.TDCreateUUID();
-        String filename = String.format("%s.blobtmp", uuid);
+    private void openTempFile() throws IOException {
         File tempDir = store.tempDir();
-        tempFile = new File(tempDir, filename);
+        String filePrefix = BlobStore.TMP_FILE_PREFIX;
+        String fileExtension = BlobStore.TMP_FILE_EXTENSION;
+        tempFile = File.createTempFile(filePrefix, fileExtension, tempDir);
         outStream = new BufferedOutputStream(new FileOutputStream(tempFile));
-
     }
 
     /** Appends data to the blob. Call this when new data is available. */
-    public void appendData(byte[] data)  {
-        try {
-            outStream.write(data);
-        } catch (IOException e) {
-            throw new RuntimeException("Unable to write to stream.", e);
-        }
-        length += data.length;
-        sha1Digest.update(data);
-        md5Digest.update(data);
+    public void appendData(byte[] data) throws IOException  {
+        appendData(data, 0, data.length);
     }
 
-    void read(InputStream inputStream) {
+    public void appendData(byte[] data, int off, int len) throws IOException {
+        outStream.write(data, off, len);
+        sha1Digest.update(data, off, len);
+        md5Digest.update(data, off, len);
+        length += len;
+    }
+
+    void read(InputStream inputStream) throws IOException {
         byte[] buffer = new byte[1024];
         int len;
         length = 0;
@@ -90,11 +85,10 @@ public class BlobStoreWriter {
                 md5Digest.update(buffer, 0, len);
                 length += len;
             }
-        } catch (IOException e) {
-            throw new RuntimeException("Unable to read from stream.", e);
         } finally {
             try {
                 inputStream.close();
+                inputStream = null;
             } catch (IOException e) {
                 Log.w(Log.TAG_BLOB_STORE, "Exception closing input stream", e);
             }
@@ -102,29 +96,35 @@ public class BlobStoreWriter {
     }
 
     /** Call this after all the data has been added. */
-    public void finish() {
-        try {
+    public void finish() throws IOException {
+        if(outStream != null) {
+            // FileOutputStream is also closed cascadingly
             outStream.close();
-        } catch (IOException e) {
-            Log.w(Log.TAG_BLOB_STORE, "Exception closing output stream", e);
+            outStream = null;
+
+            // Only create the key if we got all the data successfully
+            blobKey = new BlobKey(sha1Digest.digest());
+            md5DigestResult = md5Digest.digest();
         }
-        blobKey = new BlobKey(sha1Digest.digest());
-        md5DigestResult = md5Digest.digest();
     }
 
     /** Call this to cancel before finishing the data. */
     public void cancel() {
         try {
-            outStream.close();
+            // FileOutputStream is also closed cascadingly
+            if(outStream != null) {
+                outStream.close();
+                outStream = null;
+            }
         } catch (IOException e) {
-            Log.w(Log.TAG_BLOB_STORE, "Exception closing output stream", e);
+            Log.w(Log.TAG_BLOB_STORE, "Exception closing buffered output stream", e);
         }
         tempFile.delete();
     }
 
     /** Installs a finished blob into the store. */
-    public void install() {
-
+    public void install()
+    {
         if (tempFile == null) {
             return;  // already installed
         }
@@ -141,7 +141,6 @@ public class BlobStoreWriter {
         }
 
         tempFile = null;
-
     }
 
     public String mD5DigestString() {

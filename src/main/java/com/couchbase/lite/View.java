@@ -247,7 +247,7 @@ public final class View {
      */
     @InterfaceAudience.Public
     public void deleteIndex() {
-        if (getViewId() < 0) {
+        if (getViewId() <= 0) {
             return;
         }
 
@@ -295,18 +295,15 @@ public final class View {
     public int getViewId() {
         if (viewId < 0) {
             String sql = "SELECT view_id FROM views WHERE name=?";
-            String[] args = { name };
+            String[] args = {name};
             Cursor cursor = null;
             try {
                 cursor = database.getDatabase().rawQuery(sql, args);
                 if (cursor.moveToNext()) {
                     viewId = cursor.getInt(0);
-                } else {
-                    viewId = 0;
                 }
             } catch (SQLException e) {
                 Log.e(Log.TAG_VIEW, "Error getting view id", e);
-                viewId = 0;
             } finally {
                 if (cursor != null) {
                     cursor.close();
@@ -317,12 +314,79 @@ public final class View {
     }
 
     /**
+     * in CBLView.m
+     * - (NSUInteger) totalRows
+     */
+    @InterfaceAudience.Private
+    public int getTotalRows(){
+
+        int totalRows = -1;
+        String sql = "SELECT total_docs FROM views WHERE view_id=?";
+        String[] args = { String.valueOf(viewId) };
+        Cursor cursor = null;
+        try {
+            cursor = database.getDatabase().rawQuery(sql, args);
+            if (cursor.moveToNext()) {
+                totalRows = cursor.getInt(0);
+            }
+        } catch (SQLException e) {
+            Log.e(Log.TAG_VIEW, "Error getting total_docs", e);
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+
+        // need to count & update rows
+        if(totalRows < 0){
+            totalRows = countTotalRows();
+            if(totalRows >= 0){
+                updateTotalRows(totalRows);
+            }
+        }
+        return totalRows;
+    }
+
+    private int countTotalRows(){
+        int totalRows = -1;
+        String sql = "SELECT COUNT(view_id) FROM maps WHERE view_id=?";
+        String[] args = { String.valueOf(viewId) };
+        Cursor cursor = null;
+        try {
+            cursor = database.getDatabase().rawQuery(sql, args);
+            if (cursor.moveToNext()) {
+                totalRows = cursor.getInt(0);
+            }
+        } catch (SQLException e) {
+            Log.e(Log.TAG_VIEW, "Error getting total_docs", e);
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+        return totalRows;
+    }
+
+    private void updateTotalRows(int totalRows){
+        ContentValues values = new ContentValues();
+        values.put("total_docs=", totalRows);
+        database.getDatabase().update("views", values, "view_id=?", new String[]{ String.valueOf(viewId) });
+    }
+
+    /**
      * @exclude
      */
     @InterfaceAudience.Private
     public void databaseClosing() {
-        database = null;
-        viewId = 0;
+        // some tasks could be still in queue of thread, CBLManagerWorkExecutor.
+        // set null to database variable from CBLManagerWorkExecutor.
+        database.getManager().runAsync(new Runnable() {
+            @Override
+            public void run() {
+                database = null;
+                viewId = 0;
+            }
+        });
     }
 
     /*** Indexing ***/
@@ -381,55 +445,51 @@ public final class View {
         Cursor cursor = null;
 
         try {
-
-            long lastSequence = getLastSequenceIndexed();
+            long last = getLastSequenceIndexed();
             long dbMaxSequence = database.getLastSequenceNumber();
-            if(lastSequence == dbMaxSequence) {
+            long minLastSequence = dbMaxSequence;
+
+            // First remove obsolete emitted results from the 'maps' table:
+            if (last < 0) {
+                String msg = String.format("last < 0 (%s)", last);
+                throw new CouchbaseLiteException(msg, new Status(Status.INTERNAL_SERVER_ERROR));
+            }
+            else if(last < dbMaxSequence) {
+                minLastSequence = Math.min(minLastSequence, last);
+
+                if (last == 0) {
+
+                    // If the lastSequence has been reset to 0, make sure to remove
+                    // any leftover rows:
+                    String[] whereArgs = {Integer.toString(getViewId())};
+                    database.getDatabase().delete("maps", "view_id=?", whereArgs);
+                } else {
+                    database.optimizeSQLIndexes();
+                    // Delete all obsolete map results (ones from since-replaced
+                    // revisions):
+                    String[] args = {Integer.toString(getViewId()),
+                            Long.toString(last),
+                            Long.toString(last)};
+                    database.getDatabase().execSQL(
+                            "DELETE FROM maps WHERE view_id=? AND sequence IN ("
+                                    + "SELECT parent FROM revs WHERE sequence>? "
+                                    + "AND +parent>0 AND +parent<=?)", args);
+                }
+            }
+
+            if(minLastSequence == dbMaxSequence) {
                 // nothing to do (eg,  kCBLStatusNotModified)
-                Log.v(Log.TAG_VIEW, "lastSequence (%s) == dbMaxSequence (%s), nothing to do",
-                        lastSequence, dbMaxSequence);
+                Log.v(Log.TAG_VIEW, "minLastSequence (%s) == dbMaxSequence (%s), nothing to do", minLastSequence, dbMaxSequence);
                 result.setCode(Status.NOT_MODIFIED);
                 return;
             }
-
-            // First remove obsolete emitted results from the 'maps' table:
-            long sequence = lastSequence;
-            if (lastSequence < 0) {
-                String msg = String.format("lastSequence < 0 (%s)", lastSequence);
-                throw new CouchbaseLiteException(msg, new Status(Status.INTERNAL_SERVER_ERROR));
-            }
-
-            if (lastSequence == 0) {
-                // If the lastSequence has been reset to 0, make sure to remove
-                // any leftover rows:
-                String[] whereArgs = { Integer.toString(getViewId()) };
-                database.getDatabase().delete("maps", "view_id=?", whereArgs);
-            } else {
-                // Delete all obsolete map results (ones from since-replaced
-                // revisions):
-                String[] args = { Integer.toString(getViewId()),
-                        Long.toString(lastSequence),
-                        Long.toString(lastSequence) };
-                database.getDatabase().execSQL(
-                        "DELETE FROM maps WHERE view_id=? AND sequence IN ("
-                                + "SELECT parent FROM revs WHERE sequence>? "
-                                + "AND parent>0 AND parent<=?)", args);
-            }
-
-            int deleted = 0;
-            cursor = database.getDatabase().rawQuery("SELECT changes()", null);
-            cursor.moveToNext();
-            deleted = cursor.getInt(0);
-            cursor.close();
 
             // This is the emit() block, which gets called from within the
             // user-defined map() block
             // that's called down below.
             AbstractTouchMapEmitBlock emitBlock = new AbstractTouchMapEmitBlock() {
-
                 @Override
                 public void emit(Object key, Object value) {
-
                     try {
                         String valueJson;
                         String keyJson = Manager.getObjectMapper().writeValueAsString(key);
@@ -438,15 +498,10 @@ public final class View {
                         } else{
                             valueJson = Manager.getObjectMapper().writeValueAsString(value);
                         }
-                        //Log.v(Log.TAG_VIEW, "    emit(" + keyJson + ", "
-                        //        + valueJson + ")");
 
-                        ContentValues insertValues = new ContentValues();
-                        insertValues.put("view_id", getViewId());
-                        insertValues.put("sequence", sequence);
-                        insertValues.put("key", keyJson);
-                        insertValues.put("value", valueJson);
-                        database.getDatabase().insert("maps", null, insertValues);
+                        // NOTE: execSQL() is little faster than insert()
+                        String[] args = { Integer.toString(getViewId()),  Long.toString(sequence), keyJson, valueJson };
+                        database.getDatabase().execSQL("INSERT INTO maps (view_id, sequence, key, value) VALUES(?,?,?,?) ", args);
                     } catch (Exception e) {
                         Log.e(Log.TAG_VIEW, "Error emitting", e);
                         // find a better way to propagate this back
@@ -454,40 +509,57 @@ public final class View {
                 }
             };
 
-            // Now scan every revision added since the last time the view was
-            // indexed:
-            String[] selectArgs = { Long.toString(lastSequence) };
+            // Now scan every revision added since the last time the view was indexed:
 
-            cursor = database.getDatabase().rawQuery(
-                    "SELECT revs.doc_id, sequence, docid, revid, json, no_attachments FROM revs, docs "
-                            + "WHERE sequence>? AND current!=0 AND deleted=0 "
-                            + "AND revs.doc_id = docs.doc_id "
-                            + "ORDER BY revs.doc_id, revid DESC", selectArgs);
+            // NOTE: Below is original Query. In case query result uses a lot of memory,
+            //       Android SQLiteDatabase causes null value column. Then it causes the missing
+            //       index data because following logic skip result if column is null.
+            //       To avoid the issue, retrieving json field is isolated from original query.
+            //       Because json field could be large, maximum size is 2MB.
+            // StringBuffer sql = new StringBuffer( "SELECT revs.doc_id, sequence, docid, revid, json, no_attachments, deleted FROM revs, docs WHERE sequence>? AND current!=0 ");
 
+            StringBuffer sql = new StringBuffer( "SELECT revs.doc_id, sequence, docid, revid, no_attachments, deleted FROM revs, docs WHERE sequence>? AND current!=0 ");
+            if(minLastSequence == 0) {
+                sql.append("AND deleted=0 ");
+            }
+            sql.append("AND revs.doc_id = docs.doc_id ORDER BY revs.doc_id, revid DESC");
+            String[] selectArgs = { Long.toString(minLastSequence) };
+            cursor = database.getDatabase().rawQuery(sql.toString(), selectArgs);
 
             boolean keepGoing = cursor.moveToNext();
             while (keepGoing) {
+
+                // NOTE: skip row if 1st column is null
+                // https://github.com/couchbase/couchbase-lite-java-core/issues/497
+                if (cursor.isNull(0)) {
+                    keepGoing = cursor.moveToNext();
+                    continue;
+                }
+
                 long docID = cursor.getLong(0);
 
                 // Reconstitute the document as a dictionary:
-                sequence = cursor.getLong(1);
+                long sequence = cursor.getLong(1);
                 String docId = cursor.getString(2);
                 if(docId.startsWith("_design/")) {  // design docs don't get indexed!
                     keepGoing = cursor.moveToNext();
                     continue;
                 }
                 String revId = cursor.getString(3);
-                byte[] json = cursor.getBlob(4);
 
-                boolean noAttachments = cursor.getInt(5) > 0;
+                boolean noAttachments = cursor.getInt(4) > 0;
+                boolean deleted = cursor.getInt(5) > 0;
 
-                while ((keepGoing = cursor.moveToNext()) &&  cursor.getLong(0) == docID) {
+                while ((keepGoing = cursor.moveToNext()) && (cursor.isNull(0) || cursor.getLong(0) == docID)) {
                     // Skip rows with the same doc_id -- these are losing conflicts.
+
+                    // NOTE: Or Skip rows if 1st column is null
+                    // https://github.com/couchbase/couchbase-lite-java-core/issues/497
                 }
 
-                if (lastSequence > 0) {
+                if (minLastSequence > 0) {
                     // Find conflicts with documents from previous indexings.
-                    String[] selectArgs2 = { Long.toString(docID), Long.toString(lastSequence) };
+                    String[] selectArgs2 = { Long.toString(docID), Long.toString(minLastSequence) };
 
                     Cursor cursor2 = null;
                     try {
@@ -508,15 +580,12 @@ public final class View {
                             };
                             database.getDatabase().execSQL(
                                     "DELETE FROM maps WHERE view_id=? AND sequence=?", args);
-                            if (RevisionInternal.CBLCompareRevIDs(oldRevId, revId) > 0) {
+                            if (deleted || RevisionInternal.CBLCompareRevIDs(oldRevId, revId) > 0) {
                                 // It still 'wins' the conflict, so it's the one that
                                 // should be mapped [again], not the current revision!
                                 revId = oldRevId;
                                 sequence = oldSequence;
-
-                                String[] selectArgs3 = { Long.toString(sequence) };
-                                json = Utils.byteArrayResultForQuery(database.getDatabase(), "SELECT json FROM revs WHERE sequence=?", selectArgs3);
-
+                                deleted = false;
                             }
                         }
                     } finally {
@@ -524,9 +593,14 @@ public final class View {
                             cursor2.close();
                         }
                     }
-
-
                 }
+
+                if(deleted){
+                    continue;
+                }
+
+                String[] selectArgs3 = { Long.toString(sequence) };
+                byte[] json = Utils.byteArrayResultForQuery(database.getDatabase(), "SELECT json FROM revs WHERE sequence=?", selectArgs3);
 
                 // Get the document properties, to pass to the map function:
                 EnumSet<TDContentOptions> contentOptions = EnumSet.noneOf(Database.TDContentOptions.class);
@@ -545,27 +619,29 @@ public final class View {
                     // pairs from this revision:
                     emitBlock.setSequence(sequence);
                     mapBlock.map(properties, emitBlock);
-                }
 
+                    properties.clear();
+                    properties = null;
+                }
+                json = null;
             }
 
             // Finally, record the last revision sequence number that was
             // indexed:
             ContentValues updateValues = new ContentValues();
             updateValues.put("lastSequence", dbMaxSequence);
+            updateValues.put("total_docs", countTotalRows());
             String[] whereArgs = { Integer.toString(getViewId()) };
-            database.getDatabase().update("views", updateValues, "view_id=?",
-                    whereArgs);
+            database.getDatabase().update("views", updateValues, "view_id=?", whereArgs);
 
             // FIXME actually count number added :)
-            Log.v(Log.TAG_VIEW, "Finished re-indexing view: %s "
-                    + " up to sequence %s"
-                    + " (deleted %s added ?)", name, dbMaxSequence, deleted);
+            Log.v(Log.TAG_VIEW, "Finished re-indexing view: %s " + " up to sequence %s", name, dbMaxSequence);
             result.setCode(Status.OK);
-
-        } catch (SQLException e) {
+        }
+        catch (SQLException e) {
             throw new CouchbaseLiteException(e, new Status(Status.DB_ERROR));
-        } finally {
+        }
+        finally {
             if (cursor != null) {
                 cursor.close();
             }
@@ -576,7 +652,6 @@ public final class View {
                 database.endTransaction(result.isSuccessful());
             }
         }
-
     }
 
     /**
@@ -691,22 +766,23 @@ public final class View {
 
     /**
      * Changes a maxKey into one that also extends to any key it matches as a prefix
+     *
      * @exclude
      */
     @InterfaceAudience.Private
-    private static Object keyForPrefixMatch(Object key, int depth) {
+    protected static Object keyForPrefixMatch(Object key, int depth) {
         if (depth < 1) {
             return key;
         } else if (key instanceof String) {
             // Kludge: prefix match a string by appending max possible character value to it
-            return (String)key + "\uffff";
+            return (String) key + "\uffff";
         } else if (key instanceof List) {
-            List<Object> nuKey = new ArrayList<Object>(((List<Object>)key));
+            List<Object> nuKey = new ArrayList<Object>(((List<Object>) key));
             if (depth == 1) {
-                nuKey.add(new HashMap<String,Object>());
+                nuKey.add(new HashMap<String, Object>());
             } else {
-                Object lastObject = keyForPrefixMatch(nuKey.get(nuKey.size()-1), depth - 1);
-                nuKey.set(nuKey.size()-1, lastObject);
+                Object lastObject = keyForPrefixMatch(nuKey.get(nuKey.size() - 1), depth - 1);
+                nuKey.set(nuKey.size() - 1, lastObject);
             }
             return nuKey;
         } else {
@@ -714,19 +790,20 @@ public final class View {
         }
     }
 
-        /**
-         * Are key1 and key2 grouped together at this groupLevel?
-         * @exclude
-         */
+    /**
+     * Are key1 and key2 grouped together at this groupLevel?
+     *
+     * @exclude
+     */
     @InterfaceAudience.Private
     public static boolean groupTogether(Object key1, Object key2, int groupLevel) {
-        if(groupLevel == 0 || !(key1 instanceof List) || !(key2 instanceof List)) {
+        if (groupLevel == 0 || !(key1 instanceof List) || !(key2 instanceof List)) {
             return key1.equals(key2);
         }
         @SuppressWarnings("unchecked")
-        List<Object> key1List = (List<Object>)key1;
+        List<Object> key1List = (List<Object>) key1;
         @SuppressWarnings("unchecked")
-        List<Object> key2List = (List<Object>)key2;
+        List<Object> key2List = (List<Object>) key2;
 
         // if either key list is smaller than groupLevel and the key lists are different
         // sizes, they cannot be equal.
@@ -735,8 +812,8 @@ public final class View {
         }
 
         int end = Math.min(groupLevel, Math.min(key1List.size(), key2List.size()));
-        for(int i = 0; i < end; ++i) {
-            if(!key1List.get(i).equals(key2List.get(i))) {
+        for (int i = 0; i < end; ++i) {
+            if (!key1List.get(i).equals(key2List.get(i))) {
                 return false;
             }
         }
@@ -806,7 +883,8 @@ public final class View {
      * @exclude
      */
     @InterfaceAudience.Private
-    List<QueryRow> reducedQuery(Cursor cursor, boolean group, int groupLevel) throws CouchbaseLiteException {
+    List<QueryRow> reducedQuery(Cursor cursor, boolean group, int groupLevel,
+                                Predicate<QueryRow> postFilter) throws CouchbaseLiteException {
 
         List<Object> keysToReduce = null;
         List<Object> valuesToReduce = null;
@@ -831,7 +909,9 @@ public final class View {
                     Object key = groupKey(lastKey, groupLevel);
                     QueryRow row = new QueryRow(null, 0, key, reduced, null);
                     row.setDatabase(database);
-                    rows.add(row);
+                    if (postFilter == null || postFilter.apply(row)) {
+                        rows.add(row);
+                    }
                     keysToReduce.clear();
                     valuesToReduce.clear();
 
@@ -853,13 +933,15 @@ public final class View {
 
         }
 
-        if(keysToReduce.size() > 0) {
+        if(keysToReduce != null && keysToReduce.size() > 0) {
             // Finish the last group (or the entire list, if no grouping):
             Object key = group ? groupKey(lastKey, groupLevel) : null;
             Object reduced = (reduceBlock != null) ? reduceBlock.reduce(keysToReduce, valuesToReduce, false) : null;
             QueryRow row = new QueryRow(null, 0, key, reduced, null);
             row.setDatabase(database);
-            rows.add(row);
+            if (postFilter == null || postFilter.apply(row)) {
+                rows.add(row);
+            }
         }
 
         return rows;
@@ -882,6 +964,7 @@ public final class View {
 
         Cursor cursor = null;
         List<QueryRow> rows = new ArrayList<QueryRow>();
+        Predicate<QueryRow> postFilter = options.getPostFilter();
 
         try {
             cursor = resultSetWithOptions(options);
@@ -896,7 +979,7 @@ public final class View {
 
             if (reduce || group) {
                 // Reduced or grouped query:
-                rows = reducedQuery(cursor, group, groupLevel);
+                rows = reducedQuery(cursor, group, groupLevel, postFilter);
             } else {
                 // regular query
                 cursor.moveToNext();
@@ -932,7 +1015,9 @@ public final class View {
                     }
                     QueryRow row = new QueryRow(docId, sequence, keyDoc.jsonObject(), valueDoc.jsonObject(), docContents);
                     row.setDatabase(database);
-                    rows.add(row);
+                    if (postFilter == null || postFilter.apply(row)) {
+                        rows.add(row);
+                    }
                     cursor.moveToNext();
 
                 }

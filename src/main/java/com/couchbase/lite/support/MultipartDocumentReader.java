@@ -5,58 +5,90 @@ import com.couchbase.lite.Database;
 import com.couchbase.lite.Manager;
 import com.couchbase.lite.Misc;
 import com.couchbase.lite.util.Log;
+import com.couchbase.lite.util.Utils;
 
-import org.apache.http.HttpResponse;
 import org.apache.http.util.ByteArrayBuffer;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.zip.GZIPInputStream;
 
 public class MultipartDocumentReader implements MultipartReaderDelegate {
-
-    /** The response which contains the input stream we need to read from */
-    private HttpResponse response;
 
     private MultipartReader multipartReader;
     private BlobStoreWriter curAttachment;
     private ByteArrayBuffer jsonBuffer;
+    private boolean jsonCompressed;
     private Map<String, Object> document;
     private Database database;
     private Map<String, BlobStoreWriter> attachmentsByName;
     private Map<String, BlobStoreWriter> attachmentsByMd5Digest;
 
-    public MultipartDocumentReader(HttpResponse response, Database database) {
-        this.response = response;
+    public MultipartDocumentReader(Database database) {
         this.database = database;
     }
-
 
     public Map<String, Object> getDocumentProperties() {
         return document;
     }
 
-    public void parseJsonBuffer() {
+    public void parseJsonBuffer()
+    {
+        ByteArrayInputStream inputStream = null;
         try {
-            document = Manager.getObjectMapper().readValue(jsonBuffer.toByteArray(), Map.class);
-        } catch (IOException e) {
+            inputStream = new ByteArrayInputStream(jsonBuffer.buffer(), 0, jsonBuffer.length());
+            // compressed json
+            if (jsonCompressed) {
+                GZIPInputStream gzipStream = null;
+                try {
+                    gzipStream = new GZIPInputStream(inputStream);
+                    document = Manager.getObjectMapper().readValue(gzipStream, Map.class);
+                }
+                finally {
+                    if (gzipStream != null) { try { gzipStream.close(); } catch (IOException e) { } }
+                }
+            }
+            //  plain json
+            else {
+                document = Manager.getObjectMapper().readValue(inputStream, Map.class);
+            }
+        }
+        catch (IOException e) {
             throw new IllegalStateException("Failed to parse json buffer", e);
         }
-        jsonBuffer = null;
+        finally {
+            if (inputStream != null) { try { inputStream.close(); } catch (IOException e) { } }
+            jsonBuffer.clear();
+            jsonBuffer = null;
+        }
     }
 
-    public void setContentType(String contentType) {
-        if (contentType.startsWith("multipart/")) {
+    public void setHeaders(Map<String, String> headers){
+        String contentType = headers.get("Content-Type");
+        if(contentType.startsWith("multipart/")){
+            // Multipart, so initialize the parser:
             multipartReader = new MultipartReader(contentType, this);
             attachmentsByName = new HashMap<String, BlobStoreWriter>();
             attachmentsByMd5Digest = new HashMap<String, BlobStoreWriter>();
-        } else if (contentType == null || contentType.startsWith("application/json")
-                    || contentType.startsWith("text/plain")) {
+        }
+        else if (contentType == null ||
+                contentType.startsWith("application/json") ||
+                contentType.startsWith("text/plain")) {
+
             // No multipart, so no attachments. Body is pure JSON. (We allow text/plain because CouchDB
             // sends JSON responses using the wrong content-type.)
-        } else {
-            throw new IllegalArgumentException("contentType must start with multipart/");
+            startJSONBufferWithHeaders(headers);
         }
+        else {
+            throw new IllegalArgumentException("Unknown/invalid MIME type");
+        }
+    }
+
+    protected void startJSONBufferWithHeaders(Map<String, String> headers){
+        jsonBuffer = new ByteArrayBuffer(1024);
+        jsonCompressed = Utils.isGzip(headers.get("Content-Encoding"));
     }
 
     public void appendData(byte[] data) {
@@ -65,6 +97,14 @@ public class MultipartDocumentReader implements MultipartReaderDelegate {
         }
         else {
             jsonBuffer.append(data, 0, data.length);
+        }
+    }
+    public void appendData(byte[] data, int off, int len) {
+        if (multipartReader != null) {
+            multipartReader.appendData(data, off, len);
+        }
+        else {
+            jsonBuffer.append(data, off, len);
         }
     }
 
@@ -155,7 +195,6 @@ public class MultipartDocumentReader implements MultipartReaderDelegate {
                 Log.w(Log.TAG_REMOTE_REQUEST, "Attachment '%s' sent inline (len=%d).  Large attachments " +
                         "should be sent in MIME parts for reduced memory overhead.", attachmentName, length);
             }
-
         }
 
         if (numAttachmentsInDoc < attachmentsByMd5Digest.size()) {
@@ -173,7 +212,7 @@ public class MultipartDocumentReader implements MultipartReaderDelegate {
     public void startedPart(Map<String, String> headers) {
 
         if (document == null) {
-           jsonBuffer = new ByteArrayBuffer(1024);
+            startJSONBufferWithHeaders(headers);
         }
         else {
             curAttachment = database.getAttachmentWriter();
@@ -192,19 +231,24 @@ public class MultipartDocumentReader implements MultipartReaderDelegate {
                 }
             }
         }
-
-
     }
-
-
 
     @Override
     public void appendToPart(byte[] data) {
+        appendToPart(data, 0, data.length);
+    }
+
+    @Override
+    public void appendToPart(final byte[] data, int off, int len) {
         if (jsonBuffer != null) {
-            jsonBuffer.append(data, 0, data.length);
+            jsonBuffer.append(data, off, len);
         }
         else {
-            curAttachment.appendData(data);
+            try {
+                curAttachment.appendData(data, off, len);
+            } catch (IOException e) {
+                throw new IllegalStateException("Failed to append data", e);
+            }
         }
     }
 
@@ -214,12 +258,14 @@ public class MultipartDocumentReader implements MultipartReaderDelegate {
             parseJsonBuffer();
         }
         else {
-            curAttachment.finish();
+            try {
+                curAttachment.finish();
+            } catch (IOException e) {
+                throw new IllegalStateException("Failed to finish attachment", e);
+            }
             String md5String = curAttachment.mD5DigestString();
             attachmentsByMd5Digest.put(md5String, curAttachment);
             curAttachment = null;
         }
-
-
     }
 }

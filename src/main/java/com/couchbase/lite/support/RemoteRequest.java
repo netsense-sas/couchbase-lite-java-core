@@ -25,29 +25,25 @@ import org.apache.http.client.methods.HttpPost;
 import org.apache.http.client.methods.HttpPut;
 import org.apache.http.client.methods.HttpUriRequest;
 import org.apache.http.client.protocol.ClientContext;
-import org.apache.http.conn.ClientConnectionManager;
 import org.apache.http.entity.ByteArrayEntity;
 import org.apache.http.impl.auth.BasicScheme;
 import org.apache.http.impl.client.DefaultHttpClient;
 import org.apache.http.protocol.HttpContext;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedReader;
-import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.zip.GZIPInputStream;
 
 
 /**
  * @exclude
  */
 public class RemoteRequest implements Runnable {
+    // Don't compress data shorter than this (not worth the CPU time, plus it might not shrink)
+    public static final int MIN_JSON_LENGTH_TO_COMPRESS = 100;
 
     protected ScheduledExecutorService workExecutor;
     protected final HttpClientFactory clientFactory;
@@ -66,6 +62,9 @@ public class RemoteRequest implements Runnable {
 
     // if true, we wont log any 404 errors (useful when getting remote checkpoint doc)
     private boolean dontLog404;
+
+    // if true, send compressed (gzip) request
+    private boolean compressedRequest = false;
 
     public RemoteRequest(ScheduledExecutorService workExecutor,
                          HttpClientFactory clientFactory, String method, URL url,
@@ -91,11 +90,11 @@ public class RemoteRequest implements Runnable {
 
             HttpClient httpClient = clientFactory.getHttpClient();
 
-            ClientConnectionManager manager = httpClient.getConnectionManager();
-
             preemptivelySetAuthCredentials(httpClient);
 
             request.addHeader("Accept", "multipart/related, application/json");
+            request.addHeader("User-Agent", Manager.USER_AGENT);
+            request.addHeader("Accept-Encoding", "gzip, deflate");
 
             addRequestHeaders(request);
 
@@ -153,21 +152,6 @@ public class RemoteRequest implements Runnable {
         return request;
     }
 
-    protected void setBody(HttpUriRequest request) {
-        // set body if appropriate
-        if (body != null && request instanceof HttpEntityEnclosingRequestBase) {
-            byte[] bodyBytes = null;
-            try {
-                bodyBytes = Manager.getObjectMapper().writeValueAsBytes(body);
-            } catch (Exception e) {
-                Log.e(Log.TAG_REMOTE_REQUEST, "Error serializing body of request", e);
-            }
-            ByteArrayEntity entity = new ByteArrayEntity(bodyBytes);
-            entity.setContentType("application/json");
-            ((HttpEntityEnclosingRequestBase) request).setEntity(entity);
-        }
-    }
-
     /**
      *  Set Authenticator for BASIC Authentication
      */
@@ -183,7 +167,6 @@ public class RemoteRequest implements Runnable {
         retryCount = 0;
 
         try {
-
             fullBody = null;
             error = null;
             response = null;
@@ -214,29 +197,36 @@ public class RemoteRequest implements Runnable {
 
             StatusLine status = response.getStatusLine();
 
-
             if (status.getStatusCode() >= 300) {
                 if (!dontLog404) {
                     Log.e(Log.TAG_REMOTE_REQUEST, "Got error status: %d for %s.  Reason: %s", status.getStatusCode(), url, status.getReasonPhrase());
                 }
-                error = new HttpResponseException(status.getStatusCode(),
-                        status.getReasonPhrase());
+                error = new HttpResponseException(status.getStatusCode(), status.getReasonPhrase());
                 respondWithResult(fullBody, error, response);
                 return;
             } else {
-                HttpEntity temp = response.getEntity();
-                if (temp != null) {
-                    InputStream stream = null;
-                    try {
-                        stream = temp.getContent();
-                        fullBody = Manager.getObjectMapper().readValue(stream,
-                                Object.class);
-                    } finally {
-                        try {
-                            stream.close();
-                        } catch (IOException e) {
+                HttpEntity entity = null;
+                InputStream inputStream = null;
+                GZIPInputStream gzipStream = null;
+                try {
+                    entity = response.getEntity();
+                    if (entity != null) {
+                        inputStream = entity.getContent();
+                        // decompress if contentEncoding is gzip
+                        if (Utils.isGzip(entity)) {
+                            gzipStream = new GZIPInputStream(inputStream);
+                            fullBody = Manager.getObjectMapper().readValue(gzipStream, Object.class);
+                        } else {
+                            fullBody = Manager.getObjectMapper().readValue(inputStream, Object.class);
                         }
                     }
+                }finally {
+                    try { if (gzipStream != null) { gzipStream.close(); } } catch (IOException e) { }
+                    gzipStream = null;
+                    try { if (inputStream != null) { inputStream.close(); } } catch (IOException e) { }
+                    inputStream = null;
+                    if(entity != null){try{ entity.consumeContent(); }catch (IOException e){}}
+                    entity = null;
                 }
             }
         } catch (IOException e) {
@@ -317,10 +307,68 @@ public class RemoteRequest implements Runnable {
                     "RemoteRequestCompletionBlock throw Exception",
                     e);
         }
-
     }
 
     public void setDontLog404(boolean dontLog404) {
         this.dontLog404 = dontLog404;
+    }
+
+    public boolean isCompressedRequest() {
+        return compressedRequest;
+    }
+
+    public void setCompressedRequest(boolean compressedRequest) {
+        this.compressedRequest = compressedRequest;
+    }
+
+    protected void setBody(HttpUriRequest request) {
+        // set body if appropriate
+        if (body != null && request instanceof HttpEntityEnclosingRequestBase) {
+            byte[] bodyBytes = null;
+            try {
+                bodyBytes = Manager.getObjectMapper().writeValueAsBytes(body);
+            } catch (Exception e) {
+                Log.e(Log.TAG_REMOTE_REQUEST, "Error serializing body of request", e);
+            }
+            ByteArrayEntity entity = null;
+            if(isCompressedRequest() && bodyBytes.length > MIN_JSON_LENGTH_TO_COMPRESS){
+                entity = setCompressedBody(bodyBytes);
+            }
+            if(entity == null){
+                entity = setUncompressedBody(bodyBytes);
+            }
+            ((HttpEntityEnclosingRequestBase) request).setEntity(entity);
+        }
+    }
+    /**
+     * gzip
+     *
+     * in CBLRemoteRequest.m
+     * - (BOOL) compressBody
+     */
+    protected ByteArrayEntity setCompressedBody(byte[] bodyBytes){
+        if(bodyBytes.length < MIN_JSON_LENGTH_TO_COMPRESS){
+            return null;
+        }
+
+        // Gzipping
+        byte[] encodedBytes = Utils.compressByGzip(bodyBytes);
+
+        if(encodedBytes == null || encodedBytes.length >= bodyBytes.length) {
+            return null;
+        }
+
+        ByteArrayEntity entity = new ByteArrayEntity(encodedBytes);
+        entity.setContentType("application/json");
+        entity.setContentEncoding("gzip");
+        encodedBytes = null;
+        bodyBytes = null;
+        return entity;
+    }
+
+    protected ByteArrayEntity setUncompressedBody(byte[] bodyBytes){
+        ByteArrayEntity entity = new ByteArrayEntity(bodyBytes);
+        entity.setContentType("application/json");
+        return entity;
     }
 }

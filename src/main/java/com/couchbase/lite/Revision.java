@@ -17,11 +17,6 @@ import java.util.Map;
  */
 public abstract class Revision {
 
-    /**re
-     * The sequence number of this revision.
-     */
-    protected long sequence;
-
     /**
      * The document this is a revision of
      */
@@ -31,11 +26,6 @@ public abstract class Revision {
      * The ID of the parentRevision.
      */
     protected String parentRevID;
-
-    /**
-     * The revision this one is a child of.
-     */
-    protected SavedRevision parentRevision;
 
     /**
      * Constructor
@@ -72,7 +62,7 @@ public abstract class Revision {
     }
 
     /**
-     * Gets the Revision's id.
+     * Gets the Revision's id. In the case of an unsaved revision, may return null.
      */
     @InterfaceAudience.Public
     public abstract String getId();
@@ -124,16 +114,14 @@ public abstract class Revision {
 
     /**
      * The names of all attachments
-     * @return
      */
     @InterfaceAudience.Public
     public List<String> getAttachmentNames() {
         Map<String, Object> attachmentMetadata = getAttachmentMetadata();
-        ArrayList<String> result = new ArrayList<String>();
-        if (attachmentMetadata != null) {
-            result.addAll(attachmentMetadata.keySet());
+        if (attachmentMetadata == null) {
+            return new ArrayList<String>();
         }
-        return result;
+        return new ArrayList<String>(attachmentMetadata.keySet());
     }
 
     /**
@@ -141,10 +129,16 @@ public abstract class Revision {
      */
     @InterfaceAudience.Public
     public List<Attachment> getAttachments() {
-        List<Attachment> result = new ArrayList<Attachment>();
-        List<String> attachmentNames = getAttachmentNames();
-        for (String attachmentName : attachmentNames) {
-            result.add(getAttachment(attachmentName));
+        Map<String, Object> attachmentMetadata = getAttachmentMetadata();
+        if (attachmentMetadata == null) {
+            return new ArrayList<Attachment>();
+        }
+        List<Attachment> result = new ArrayList<Attachment>(attachmentMetadata.size());
+        for (Map.Entry<String, Object> entry: attachmentMetadata.entrySet()) {
+            Attachment attachment = toAttachment(entry.getKey(), entry.getValue());
+            if (attachment != null) {
+                result.add(attachment);
+            }
         }
         return result;
     }
@@ -166,13 +160,18 @@ public abstract class Revision {
         if (attachmentsMetadata == null) {
             return null;
         }
-        Map<String, Object> attachmentMetadata = (Map<String, Object>) attachmentsMetadata.get(name);
+        return toAttachment(name, attachmentsMetadata.get(name));
+    }
 
-        if (attachmentMetadata == null) {
+    private Attachment toAttachment(String name, Object attachment) {
+        if (attachment == null) {
             return null;
+        } else if (attachment instanceof Attachment) {
+            return (Attachment) attachment;
+        } else {
+            Map<String, Object> metadata = (Map<String, Object>) attachment;
+            return new Attachment(this, name, metadata);
         }
-
-        return new Attachment(this, name, attachmentMetadata);
     }
 
     /**
@@ -186,6 +185,12 @@ public abstract class Revision {
      */
     @InterfaceAudience.Public
     public abstract String getParentId();
+
+    /**
+     * @exclude
+     */
+    @InterfaceAudience.Private
+    /* package */ abstract long getParentSequence();
 
     /**
      * Returns the history of this document as an array of CBLRevisions, in forward order.
@@ -215,7 +220,7 @@ public abstract class Revision {
      * Compare this revision to the given revision to check for equality.
      * The comparison makes sure that both revisions have the same revision ID.
      *
-     * @param the revision to check for equality against
+     * @param o the revision to check for equality against
      * @return true if equal, false otherwise
      */
     @Override
@@ -270,17 +275,7 @@ public abstract class Revision {
      * @exclude
      */
     @InterfaceAudience.Private
-    /* package */ void setSequence(long sequence) {
-        this.sequence = sequence;
-    }
-
-    /**
-     * @exclude
-     */
-    @InterfaceAudience.Private
-    /* package */ long getSequence() {
-        return sequence;
-    }
+    /* package */ abstract long getSequence();
 
     /**
      * Generation number: 1 for a new document, 2 for the 2nd revision, ...

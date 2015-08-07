@@ -95,12 +95,10 @@ public final class SavedRevision extends Revision {
     /**
      * Creates a new mutable child revision whose properties and attachments are initially identical
      * to this one's, which you can modify and then save.
-     * @return
      */
     @InterfaceAudience.Public
-    public UnsavedRevision createRevision() throws CouchbaseLiteException {
-        UnsavedRevision newRevision = new UnsavedRevision(document, this);
-        return newRevision;
+    public UnsavedRevision createRevision() {
+        return new UnsavedRevision(document, this);
     }
 
     /**
@@ -172,6 +170,13 @@ public final class SavedRevision extends Revision {
     }
 
     @Override
+    @InterfaceAudience.Private
+    /* package */ long getParentSequence() {
+        SavedRevision parent = getParent();
+        return (parent != null) ? parent.getSequence() : 0L;
+    }
+
+    @Override
     @InterfaceAudience.Public
     public long getSequence() {
         long sequence = revisionInternal.getSequence();
@@ -198,10 +203,7 @@ public final class SavedRevision extends Revision {
         } catch (CouchbaseLiteException e) {
             throw new RuntimeException(e);
         }
-
     }
-
-
 }
 
 

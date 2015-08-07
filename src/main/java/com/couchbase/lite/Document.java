@@ -14,7 +14,7 @@ import java.util.Map;
 /**
  * A CouchbaseLite document.
  */
-public final class Document {
+public class Document {
 
     /**
      * The document's owning database.
@@ -146,10 +146,12 @@ public final class Document {
      * Any keys in the dictionary that begin with "_", such as "_id" and "_rev", contain CouchbaseLite metadata.
      *
      * @return contents of the current revision of the document.
+     *         null if currentRevision is null
      */
     @InterfaceAudience.Public
     public Map<String,Object> getProperties() {
-        return getCurrentRevision().getProperties();
+        SavedRevision currentRevision = getCurrentRevision();
+        return currentRevision == null ? null : currentRevision.getProperties();
     }
 
     /**
@@ -267,6 +269,10 @@ public final class Document {
 
         int lastErrorCode = Status.UNKNOWN;
         do {
+            // if there is a conflict error, get the latest revision from db instead of cache
+            if (lastErrorCode == Status.CONFLICT) {
+                forgetCurrentRevision();
+            }
             UnsavedRevision newRev = createRevision();
             if (updater.update(newRev) == false) {
                 break;
@@ -282,7 +288,6 @@ public final class Document {
 
         } while (lastErrorCode == Status.CONFLICT);
         return null;
-
     }
 
 
@@ -408,7 +413,7 @@ public final class Document {
             hasTrueDeletedProperty = properties.get("_deleted") != null && ((Boolean)properties.get("_deleted")).booleanValue();
         }
         boolean deleted = (properties == null) || hasTrueDeletedProperty;
-        RevisionInternal rev = new RevisionInternal(documentId, null, deleted, database);
+        RevisionInternal rev = new RevisionInternal(documentId, null, deleted);
         if (properties != null) {
             rev.setProperties(properties);
         }
@@ -462,13 +467,14 @@ public final class Document {
         }
         String revId = row.getDocumentRevisionId();
         if (currentRevision == null || revIdGreaterThanCurrent(revId)) {
+            forgetCurrentRevision();
             Map<String, Object> properties = row.getDocumentProperties();
             if (properties != null) {
-                RevisionInternal rev = new RevisionInternal(properties, row.getDatabase());
+                RevisionInternal rev = new RevisionInternal(properties);
                 currentRevision = new SavedRevision(this, rev);
             }
         }
-     }
+    }
 
     /**
      * @exclude
@@ -482,26 +488,30 @@ public final class Document {
      * @exclude
      */
     @InterfaceAudience.Private
-    /* package */ void revisionAdded(DocumentChange documentChange) {
+    /* package */ void revisionAdded(DocumentChange change, boolean notify) {
 
-        RevisionInternal rev = documentChange.getWinningRevision();
+        RevisionInternal rev = change.getWinningRevision();
         if (rev == null) {
             return;  // current revision didn't change
         }
 
         if (currentRevision != null && !rev.getRevId().equals(currentRevision.getId())) {
-            if (!rev.isDeleted()) {
-                currentRevision = new SavedRevision(this, rev);
-            } else {
+            if (rev.isDeleted()) {
                 currentRevision = null;
+            } else {
+                currentRevision = new SavedRevision(this, rev);
             }
         }
 
-        for (ChangeListener listener : changeListeners) {
-            listener.changed(new ChangeEvent(this, documentChange));
+        if (notify) {
+            for (ChangeListener listener : changeListeners) {
+                listener.changed(new ChangeEvent(this, change));
+            }
         }
-
     }
 
-
+    @InterfaceAudience.Private
+    protected void forgetCurrentRevision() {
+        currentRevision = null;
+    }
 }

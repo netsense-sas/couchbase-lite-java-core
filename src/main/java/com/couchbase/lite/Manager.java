@@ -10,8 +10,8 @@ import com.couchbase.lite.support.HttpClientFactory;
 import com.couchbase.lite.support.Version;
 import com.couchbase.lite.util.Log;
 import com.couchbase.lite.util.StreamUtils;
-
-import org.codehaus.jackson.map.ObjectMapper;
+import com.couchbase.lite.util.Utils;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -44,7 +44,7 @@ public final class Manager {
     /**
      * @exclude
      */
-    public static final String HTTP_ERROR_DOMAIN =  "CBLHTTP";
+    public static final String HTTP_ERROR_DOMAIN = "CBLHTTP";
 
     /**
      * @exclude
@@ -68,6 +68,8 @@ public final class Manager {
 
     public static final String VERSION = Version.VERSION;
 
+    public static final String USER_AGENT = "CouchbaseLite/" + Version.getVersionName();
+
     private static final ObjectMapper mapper = new ObjectMapper();
     private ManagerOptions options;
     private File directoryFile;
@@ -76,6 +78,7 @@ public final class Manager {
     private ScheduledExecutorService workExecutor;
     private HttpClientFactory defaultHttpClientFactory;
     private Context context;
+
 
     /**
      * @exclude
@@ -87,6 +90,7 @@ public final class Manager {
 
     /**
      * Constructor
+     *
      * @throws UnsupportedOperationException - not currently supported
      * @exclude
      */
@@ -99,8 +103,9 @@ public final class Manager {
 
     /**
      * Enable logging for a particular tag / loglevel combo
-     * @param tag Used to identify the source of a log message.  It usually identifies
-     *        the class or activity where the log call occurs.
+     *
+     * @param tag      Used to identify the source of a log message.  It usually identifies
+     *                 the class or activity where the log call occurs.
      * @param logLevel The loglevel to enable.  Anything matching this loglevel
      *                 or having a more urgent loglevel will be emitted.  Eg, Log.VERBOSE.
      */
@@ -124,7 +129,9 @@ public final class Manager {
         this.databases = new HashMap<String, Database>();
         this.replications = new ArrayList<Replication>();
 
-        directoryFile.mkdirs();
+        if (!directoryFile.exists()) {
+            directoryFile.mkdirs();
+        }
         if (!directoryFile.isDirectory()) {
             throw new IOException(String.format("Unable to create directory for: %s", directoryFile));
         }
@@ -141,11 +148,11 @@ public final class Manager {
                 return new Thread(r, "CBLManagerWorkExecutor");
             }
         });
-
     }
 
     /**
      * Get shared instance
+     *
      * @throws UnsupportedOperationException - not currently supported
      * @exclude
      */
@@ -187,7 +194,7 @@ public final class Manager {
 
             @Override
             public boolean accept(File dir, String filename) {
-                if(filename.endsWith(Manager.DATABASE_SUFFIX)) {
+                if (filename.endsWith(Manager.DATABASE_SUFFIX)) {
                     return true;
                 }
                 return false;
@@ -210,19 +217,19 @@ public final class Manager {
     public void close() {
         Log.i(Database.TAG, "Closing " + this);
         for (Database database : databases.values()) {
-            List<Replication> replicators = database.getAllReplications();
-            if (replicators != null) {
-                for (Replication replicator : replicators) {
-                    replicator.stop();
-                }
-            }
+            // Database.close() closes all active replicators
             database.close();
         }
         databases.clear();
         context.getNetworkReachabilityManager().stopListening();
+
+        // shutdown ScheduledExecutorService
+        if (workExecutor != null && !workExecutor.isShutdown()) {
+            Utils.shutdownAndAwaitTermination(workExecutor);
+        }
+
         Log.i(Database.TAG, "Closed " + this);
     }
-
 
     /**
      * Returns the database with the given name, or creates it if it doesn't exist.
@@ -255,52 +262,51 @@ public final class Manager {
         return db;
     }
 
-
     /**
      * Replaces or installs a database from a file.
-     *
+     * <p/>
      * This is primarily used to install a canned database on first launch of an app, in which case
      * you should first check .exists to avoid replacing the database if it exists already. The
      * canned database would have been copied into your app bundle at build time.
      *
-     * @param databaseName  The name of the target Database to replace or create.
-     * @param databaseStream  InputStream on the source Database file.
-     * @param attachmentStreams  Map of the associated source Attachments, or null if there are no attachments.
-     *                           The Map key is the name of the attachment, the map value is an InputStream for
-     *                           the attachment contents. If you wish to control the order that the attachments
-     *                           will be processed, use a LinkedHashMap, SortedMap or similar and the iteration order
-     *                           will be honoured.
-     **/
+     * @param databaseName      The name of the target Database to replace or create.
+     * @param databaseStream    InputStream on the source Database file.
+     * @param attachmentStreams Map of the associated source Attachments, or null if there are no attachments.
+     *                          The Map key is the name of the attachment, the map value is an InputStream for
+     *                          the attachment contents. If you wish to control the order that the attachments
+     *                          will be processed, use a LinkedHashMap, SortedMap or similar and the iteration order
+     *                          will be honoured.
+     */
     @InterfaceAudience.Public
-    public void replaceDatabase(String databaseName, InputStream databaseStream, Map<String,InputStream> attachmentStreams) throws CouchbaseLiteException {
+    public void replaceDatabase(String databaseName, InputStream databaseStream, Map<String, InputStream> attachmentStreams) throws CouchbaseLiteException {
         replaceDatabase(databaseName, databaseStream, attachmentStreams == null ? null : attachmentStreams.entrySet().iterator());
     }
 
-    private void replaceDatabase(String databaseName, InputStream databaseStream, Iterator<Map.Entry<String,InputStream>> attachmentStreams) throws CouchbaseLiteException {
+    private void replaceDatabase(String databaseName, InputStream databaseStream, Iterator<Map.Entry<String, InputStream>> attachmentStreams) throws CouchbaseLiteException {
         try {
-            Database database = getDatabase(databaseName);
+            //Database database = getDatabase(databaseName);
+            Database database = getDatabaseWithoutOpening(databaseName, false);
             String dstAttachmentsPath = database.getAttachmentStorePath();
             OutputStream destStream = new FileOutputStream(new File(database.getPath()));
             StreamUtils.copyStream(databaseStream, destStream);
             File attachmentsFile = new File(dstAttachmentsPath);
             FileDirUtils.deleteRecursive(attachmentsFile);
-            attachmentsFile.mkdirs();
-            if(attachmentStreams != null) {
-                StreamUtils.copyStreamsToFolder(attachmentStreams,attachmentsFile);
+            if (!attachmentsFile.exists()) {
+                attachmentsFile.mkdirs();
+            }
+            if (attachmentStreams != null) {
+                StreamUtils.copyStreamsToFolder(attachmentStreams, attachmentsFile);
             }
 
             database.open();
             database.replaceUUIDs();
-        }
-        catch (FileNotFoundException e) {
+        } catch (FileNotFoundException e) {
+            Log.e(Database.TAG, "", e);
+            throw new CouchbaseLiteException(Status.INTERNAL_SERVER_ERROR);
+        } catch (IOException e) {
             Log.e(Database.TAG, "", e);
             throw new CouchbaseLiteException(Status.INTERNAL_SERVER_ERROR);
         }
-        catch (IOException e) {
-            Log.e(Database.TAG, "", e);
-            throw new CouchbaseLiteException(Status.INTERNAL_SERVER_ERROR);
-        }
-
     }
 
     /**
@@ -363,7 +369,7 @@ public final class Manager {
      */
     @InterfaceAudience.Private
     private String filenameWithNewExtension(String oldFilename, String oldExtension, String newExtension) {
-        String oldExtensionRegex = String.format("%s$",oldExtension);
+        String oldExtensionRegex = String.format("%s$", oldExtension);
         return oldFilename.replaceAll(oldExtensionRegex, newExtension);
     }
 
@@ -375,16 +381,15 @@ public final class Manager {
         return databases.values();
     }
 
-
     /**
      * Asynchronously dispatches a callback to run on a background thread. The callback will be passed
      * Database instance.  There is not currently a known reason to use it, it may not make
      * sense on the Android API, but it was added for the purpose of having a consistent API with iOS.
+     *
      * @exclude
      */
     @InterfaceAudience.Private
     public Future runAsync(String databaseName, final AsyncTask function) throws CouchbaseLiteException {
-
         final Database database = getDatabase(databaseName);
         return runAsync(new Runnable() {
             @Override
@@ -392,7 +397,6 @@ public final class Manager {
                 function.run(database);
             }
         });
-
     }
 
     /**
@@ -400,7 +404,13 @@ public final class Manager {
      */
     @InterfaceAudience.Private
     Future runAsync(Runnable runnable) {
-        return workExecutor.submit(runnable);
+        synchronized (workExecutor) {
+            if (!workExecutor.isShutdown()) {
+                return workExecutor.submit(runnable);
+            } else {
+                return null;
+            }
+        }
     }
 
     /**
@@ -408,10 +418,17 @@ public final class Manager {
      */
     @InterfaceAudience.Private
     private String pathForName(String name) {
-        if((name == null) || (name.length() == 0) || Pattern.matches(LEGAL_CHARACTERS, name)) {
+        if ((name == null) || (name.length() == 0) || Pattern.matches(LEGAL_CHARACTERS, name)) {
             return null;
         }
-        name = name.replace('/', ':');
+        // NOTE: CouchDB allows forward slash as part of database name.
+        //       However, ':' is illegal character on Windows platform.
+        //       For Windows, substitute with period '.'
+        if(isWindows()) {
+            name = name.replace('/', '.');
+        }else{
+            name = name.replace('/', ':');
+        }
         String result = directoryFile.getPath() + File.separator + name + Manager.DATABASE_SUFFIX;
         return result;
     }
@@ -420,19 +437,17 @@ public final class Manager {
      * @exclude
      */
     @InterfaceAudience.Private
-    private Map<String, Object> parseSourceOrTarget(Map<String,Object> properties, String key) {
+    private Map<String, Object> parseSourceOrTarget(Map<String, Object> properties, String key) {
         Map<String, Object> result = new HashMap<String, Object>();
 
         Object value = properties.get(key);
 
         if (value instanceof String) {
-            result.put("url", (String)value);
-        }
-        else if (value instanceof Map) {
+            result.put("url", (String) value);
+        } else if (value instanceof Map) {
             result = (Map<String, Object>) value;
         }
         return result;
-
     }
 
     /**
@@ -444,7 +459,6 @@ public final class Manager {
             if (replicator.getLocalDatabase() == db && replicator.getRemoteUrl().equals(remote) && replicator.isPull() == !push) {
                 return replicator;
             }
-
         }
         if (!create) {
             return null;
@@ -455,8 +469,7 @@ public final class Manager {
 
         if (push) {
             replicator = new Replication(db, remote, Replication.Direction.PUSH, null, getWorkExecutor());
-        }
-        else {
+        } else {
             replicator = new Replication(db, remote, Replication.Direction.PULL, null, getWorkExecutor());
         }
 
@@ -474,7 +487,7 @@ public final class Manager {
     @InterfaceAudience.Private
     public synchronized Database getDatabaseWithoutOpening(String name, boolean mustExist) {
         Database db = databases.get(name);
-        if(db == null) {
+        if (db == null) {
             if (!isValidDatabaseName(name)) {
                 throw new IllegalArgumentException("Invalid database name: " + name);
             }
@@ -520,7 +533,7 @@ public final class Manager {
      * @exclude
      */
     @InterfaceAudience.Private
-    public Replication getReplicator(Map<String,Object> properties) throws CouchbaseLiteException {
+    public Replication getReplicator(Map<String, Object> properties) throws CouchbaseLiteException {
 
         // TODO: in the iOS equivalent of this code, there is: {@"doc_ids", _documentIDs}) - write unit test that detects this bug
         // TODO: ditto for "headers"
@@ -534,20 +547,20 @@ public final class Manager {
         Map<String, Object> sourceMap = parseSourceOrTarget(properties, "source");
         Map<String, Object> targetMap = parseSourceOrTarget(properties, "target");
 
-        String source = (String)sourceMap.get("url");
-        String target = (String)targetMap.get("url");
+        String source = (String) sourceMap.get("url");
+        String target = (String) targetMap.get("url");
 
-        Boolean createTargetBoolean = (Boolean)properties.get("create_target");
+        Boolean createTargetBoolean = (Boolean) properties.get("create_target");
         boolean createTarget = (createTargetBoolean != null && createTargetBoolean.booleanValue());
 
-        Boolean continuousBoolean = (Boolean)properties.get("continuous");
+        Boolean continuousBoolean = (Boolean) properties.get("continuous");
         boolean continuous = (continuousBoolean != null && continuousBoolean.booleanValue());
 
-        Boolean cancelBoolean = (Boolean)properties.get("cancel");
+        Boolean cancelBoolean = (Boolean) properties.get("cancel");
         boolean cancel = (cancelBoolean != null && cancelBoolean.booleanValue());
 
         // Map the 'source' and 'target' JSON params to a local database and remote URL:
-        if(source == null || target == null) {
+        if (source == null || target == null) {
             throw new CouchbaseLiteException("source and target are both null", new Status(Status.BAD_REQUEST));
         }
 
@@ -562,22 +575,20 @@ public final class Manager {
             remoteMap = targetMap;
         } else {
             remoteStr = source;
-            if(createTarget && !cancel) {
+            if (createTarget && !cancel) {
                 boolean mustExist = false;
                 db = getDatabaseWithoutOpening(target, mustExist);
-                if(!db.open()) {
+                if (!db.open()) {
                     throw new CouchbaseLiteException("cannot open database: " + db, new Status(Status.INTERNAL_SERVER_ERROR));
                 }
             } else {
                 db = getExistingDatabase(target);
             }
-            if(db == null) {
+            if (db == null) {
                 throw new CouchbaseLiteException("database is null", new Status(Status.NOT_FOUND));
             }
             remoteMap = sourceMap;
-
         }
-
 
         Map<String, Object> authMap = (Map<String, Object>) remoteMap.get("auth");
         if (authMap != null) {
@@ -592,7 +603,6 @@ public final class Manager {
                 String email = (String) facebook.get("email");
                 authorizer = new FacebookAuthorizer(email);
             }
-
         }
 
         try {
@@ -600,14 +610,13 @@ public final class Manager {
         } catch (MalformedURLException e) {
             throw new CouchbaseLiteException("malformed remote url: " + remoteStr, new Status(Status.BAD_REQUEST));
         }
-        if(remote == null) {
+        if (remote == null) {
             throw new CouchbaseLiteException("remote URL is null: " + remoteStr, new Status(Status.BAD_REQUEST));
         }
 
-
-        if(!cancel) {
+        if (!cancel) {
             repl = db.getReplicator(remote, getDefaultHttpClientFactory(), push, continuous, getWorkExecutor());
-            if(repl == null) {
+            if (repl == null) {
                 throw new CouchbaseLiteException("unable to create replicator with remote: " + remote, new Status(Status.INTERNAL_SERVER_ERROR));
             }
 
@@ -615,29 +624,31 @@ public final class Manager {
                 repl.setAuthenticator(authorizer);
             }
 
-            Map<String, Object> headers = (Map) properties.get("headers");
+            Map<String, Object> headers = null;
+            if (remoteMap != null) {
+                headers = (Map) remoteMap.get("headers");
+            }
+
             if (headers != null && !headers.isEmpty()) {
                 repl.setHeaders(headers);
             }
 
-            String filterName = (String)properties.get("filter");
-            if(filterName != null) {
+            String filterName = (String) properties.get("filter");
+            if (filterName != null) {
                 repl.setFilter(filterName);
-                Map<String,Object> filterParams = (Map<String,Object>)properties.get("query_params");
-                if(filterParams != null) {
+                Map<String, Object> filterParams = (Map<String, Object>) properties.get("query_params");
+                if (filterParams != null) {
                     repl.setFilterParams(filterParams);
                 }
             }
 
-            if(push) {
+            if (push) {
                 repl.setCreateTarget(createTarget);
             }
-
-
         } else {
             // Cancel replication:
             repl = db.getActiveReplicator(remote, push);
-            if(repl == null) {
+            if (repl == null) {
                 throw new CouchbaseLiteException("unable to lookup replicator with remote: " + remote, new Status(Status.NOT_FOUND));
             }
         }
@@ -653,11 +664,38 @@ public final class Manager {
         return workExecutor;
     }
 
+    /**
+     * @exclude
+     */
     @InterfaceAudience.Private
     public Context getContext() {
         return context;
     }
 
+    /**
+     * @exclude
+     */
+    @InterfaceAudience.Private
+    protected boolean isAutoMigrateBlobStoreFilename() {
+        return this.options.isAutoMigrateBlobStoreFilename();
+    }
 
+    private static String OS = System.getProperty("os.name").toLowerCase();
+
+    /**
+     * Check if platform is Windows
+     */
+    @InterfaceAudience.Private
+    private static boolean isWindows() {
+        return (OS.indexOf("win") >= 0);
+    }
+
+    /**
+     * @exclude
+     */
+    @InterfaceAudience.Private
+    public int getExecutorThreadPoolSize() {
+        return this.options.getExecutorThreadPoolSize();
+    }
 }
 
