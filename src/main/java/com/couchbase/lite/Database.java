@@ -1429,6 +1429,8 @@ public final class Database {
             List<CountDownLatch> latches = new ArrayList<CountDownLatch>();
             synchronized (activeReplicators) {
                 for (Replication replicator : activeReplicators) {
+                    if(replicator.getStatus() == Replication.ReplicationStatus.REPLICATION_STOPPED)
+                        continue;
                     // handler to check if the replicator stopped
                     final CountDownLatch latch = new CountDownLatch(1);
                     replicator.addChangeListener(new Replication.ChangeListener() {
